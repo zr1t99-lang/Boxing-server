@@ -11,18 +11,28 @@
      {t:'ready', ready}                     toggle "ready"; only allowed while cam is ready
      {t:'leave'}                            leave the room
      {t:'ping', n}                          heartbeat
+     {t:'pose', q, ts, p:[18 ints]}         my compact upper-body pose (Phase 3); relayed to the other player only
+     {t:'punch', id, ts, s:'R'|'L', k}      one physical punch with a unique, increasing id; a repeated or older id is dropped
    Server -> client messages:
      {t:'welcome', id, v}
      {t:'room', code, you, state, players:[{slot,name,connected,cam,ready}]}
      {t:'left'}                             you are no longer in a room
      {t:'error', code, msg}
      {t:'pong', n}
+     {t:'pose' ...} / {t:'punch' ...}       the opponent's pose and punches, exactly as validated by the server
    Room state: 'lobby' (waiting / not everyone ready) | 'ready' (two players present, camera-ready and ready).
    A room never holds more than two players. */
 (function (root) {
   var ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';          // no 0/O/1/I so a code can be read out loud
   var CODE_RE = /^[A-HJ-NP-Z2-9]{6}$/;
-  var V = 1;
+  var V = 2;                                                   // 2 = pose/punch relay
+
+  var POSE_LEN = 18, POSE_LIM = 3000, KINDS = { jab: 1, cross: 1, hook: 1, upper: 1 };
+  function validPose(p) {
+    if (!Array.isArray(p) || p.length !== POSE_LEN) return false;
+    for (var i = 0; i < POSE_LEN; i++) { var v = p[i]; if (typeof v !== 'number' || !isFinite(v) || Math.floor(v) !== v || v > POSE_LIM || v < -POSE_LIM) return false; }
+    return true;
+  }
 
   function RoomManager(opts) {
     opts = opts || {};
@@ -43,7 +53,8 @@
     return null;
   };
   RoomManager.prototype.connect = function (id, send) {
-    this.clients[id] = { id: id, send: send, room: null, name: 'Player', cam: false, lastSeen: this.now() };
+    this.clients[id] = { id: id, send: send, room: null, name: 'Player', cam: false, lastSeen: this.now(), poseAt: -1e9, punchAt: -1e9, lastQ: 0, lastPunchId: 0 };
+    this.stats = this.stats || { pose: 0, punch: 0, dropped: 0, dupPunch: 0 };
     send({ t: 'welcome', id: id, v: V });
   };
   RoomManager.prototype.has = function (id) { return !!this.clients[id]; };
@@ -105,9 +116,29 @@
         if (msg.ready) room.ready[id] = true; else delete room.ready[id];
         return this.broadcast(room);
       }
+      case 'pose': case 'punch': return this.relay(cl, room, msg);
       case 'leave': return this.removeFromRoom(cl, true);
       default: return this.err(cl, 'unknown', 'Unknown message type');
     }
+  };
+
+  /* Pose and punch relay. Only between the two players of a room, never echoed to the sender, always validated.
+     Bad data, rate abuse, repeated or older sequence numbers and repeated punch ids are dropped silently (no error spam at 20 Hz). */
+  RoomManager.prototype.relay = function (cl, room, msg) {
+    var st = this.stats = this.stats || { pose: 0, punch: 0, dropped: 0, dupPunch: 0 }, t = this.now();
+    if (!room || !room.slots[0] || !room.slots[1]) { st.dropped++; return; }
+    var other = this.clients[room.slots[0] === cl.id ? room.slots[1] : room.slots[0]]; if (!other) { st.dropped++; return; }
+    if (msg.t === 'pose') {
+      if (!validPose(msg.p) || !(msg.q > 0) || Math.floor(msg.q) !== msg.q || typeof msg.ts !== 'number' || !isFinite(msg.ts) || msg.q <= cl.lastQ) { st.dropped++; return; }
+      if (t - cl.poseAt < 25) { st.dropped++; return; }                          // at most 40 poses per second per player
+      cl.poseAt = t; cl.lastQ = msg.q; st.pose++;
+      return other.send({ t: 'pose', q: msg.q, ts: msg.ts, p: msg.p });
+    }
+    if (!(msg.id > 0) || Math.floor(msg.id) !== msg.id || (msg.s !== 'R' && msg.s !== 'L') || !KINDS[msg.k] || typeof msg.ts !== 'number' || !isFinite(msg.ts)) { st.dropped++; return; }
+    if (msg.id <= cl.lastPunchId) { st.dupPunch++; return; }                      // the same physical punch can never be relayed (or later scored) twice
+    if (t - cl.punchAt < 80) { st.dropped++; return; }
+    cl.punchAt = t; cl.lastPunchId = msg.id; st.punch++;
+    other.send({ t: 'punch', id: msg.id, ts: msg.ts, s: msg.s, k: msg.k });
   };
 
   RoomManager.prototype.disconnect = function (id) {

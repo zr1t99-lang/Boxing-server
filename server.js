@@ -13,7 +13,7 @@ function createServer(opts) {
   const perIp = new Map();
   let nextId = 1;
   const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'content-type': 'text/plain' }); res.end('Motion Boxing server ok. rooms=' + Object.keys(rooms.rooms).length + ' clients=' + Object.keys(rooms.clients).length + '\n');
+    res.writeHead(200, { 'content-type': 'text/plain' }); res.end('Motion Boxing server ok. rooms=' + Object.keys(rooms.rooms).length + ' clients=' + Object.keys(rooms.clients).length + ' pose=' + ((rooms.stats || {}).pose || 0) + ' punch=' + ((rooms.stats || {}).punch || 0) + ' v2\n');
   });
 
   function frame(op, buf) {
@@ -53,7 +53,7 @@ function createServer(opts) {
         if (op === 0xA) continue;
         if (op !== 0x1) continue;
         const now = Date.now(); if (now - windowStart > 1000) { windowStart = now; msgCount = 0; }
-        if (++msgCount > 60) return close();                                  // flood protection: 60 messages per second
+        if (++msgCount > 100) return close();                                 // flood protection: 100 messages per second (pose 20/s + punches + heartbeat stay far below)
         let msg; try { msg = JSON.parse(data.toString('utf8')); } catch (e) { msg = null; }
         rooms.handle(id, msg);
       }
