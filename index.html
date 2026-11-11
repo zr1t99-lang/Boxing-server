@@ -38,6 +38,16 @@ body {
 h1, h2, h3, p { margin: 0; }
 :focus-visible { outline: 3px solid var(--cyan); outline-offset: 3px; }
 
+.stagebg { position: fixed; inset: -4%; background-size: cover; background-position: center; filter: blur(22px) brightness(0.45) saturate(1.1); z-index: 0; }
+.stagebox { position: fixed; transform-origin: 0 0; padding: 12px 16px; z-index: 1; overflow: hidden; }
+.stagebox .screen { min-height: 676px; }
+.stagebox .screen.fit { height: 676px; min-height: 0; }
+.stage .mfs { background: transparent; }
+.stage .mpip { position: fixed; left: 2vw; right: auto; top: 3vh; width: min(22vw, 28vh); }
+.stage .mpip.lowpip { top: 3vh; bottom: auto; }
+.tvhint { position: fixed; left: 8px; right: 8px; top: 8px; z-index: 60; text-align: center; font: 700 13px/1.3 var(--body); color: #2a1d00; background: var(--gold); border-radius: 12px; padding: 9px 12px; pointer-events: none; }
+.tvbtn { position: absolute; right: 0; top: 0; z-index: 3; padding: 7px 11px !important; font-size: 12px !important; border-radius: 999px !important; min-height: 0; }
+.tvbtn.on { background: var(--gold); color: #2a1d00; border-color: transparent; }
 .screen { max-width: 540px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; min-height: calc(100vh - 24px); min-height: calc(100dvh - 24px); justify-content: center; }
 .logo { font: 400 clamp(40px, 12vw, 68px)/0.95 var(--display); color: var(--gold); text-shadow: 0 4px 0 var(--red-deep), 0 9px 0 rgba(0, 0, 0, 0.35); text-wrap: balance; text-align: center; letter-spacing: 0.01em; }
 .title { font: 400 clamp(26px, 7vw, 34px)/1.05 var(--display); color: var(--gold); text-shadow: 0 3px 0 var(--red-deep); text-wrap: balance; }
@@ -837,15 +847,16 @@ var CFG = {
 };
 
 /* User-tunable settings (saved on this device). dodge and punch are sensitivity multipliers: 1 = default, higher = more sensitive. */
-var SETTINGS = { dodge: 1, punch: 1, dead: 1, anim: true, dev: false };
+var SETTINGS = { dodge: 0.7, punch: 1, dead: 1, anim: true, dev: false };      // dodge default lowered to 0.7 (sideways movement felt too fast); 1.00 is the previous behaviour
 (function () {
   try {
-    var o = JSON.parse(localStorage.getItem('mb.settings2') || 'null');
-    if (o) { if (typeof o.dodge === 'number') SETTINGS.dodge = clamp(o.dodge, 0.4, 2.5); if (typeof o.punch === 'number') SETTINGS.punch = clamp(o.punch, 0.4, 2.5); if (typeof o.dead === 'number') SETTINGS.dead = clamp(o.dead, 0.4, 2.5); if (typeof o.anim === 'boolean') SETTINGS.anim = o.anim; }
+    var o = JSON.parse(localStorage.getItem('mb.settings3') || 'null'), old = false;
+    if (!o) { o = JSON.parse(localStorage.getItem('mb.settings2') || 'null'); old = true; }          // settings saved before the lower default: keep punch/dead, take the new dodge default
+    if (o) { if (!old && typeof o.dodge === 'number') SETTINGS.dodge = clamp(o.dodge, 0.4, 2.5); if (typeof o.punch === 'number') SETTINGS.punch = clamp(o.punch, 0.4, 2.5); if (typeof o.dead === 'number') SETTINGS.dead = clamp(o.dead, 0.4, 2.5); if (typeof o.anim === 'boolean') SETTINGS.anim = o.anim; }
   } catch (e) {}
   try { if (/[?&]dev=1/.test(location.search)) SETTINGS.dev = true; } catch (e) {}
 })();
-function saveSettings() { try { localStorage.setItem('mb.settings2', JSON.stringify({ dodge: SETTINGS.dodge, punch: SETTINGS.punch, dead: SETTINGS.dead, anim: SETTINGS.anim })); } catch (e) {} }
+function saveSettings() { try { localStorage.setItem('mb.settings3', JSON.stringify({ dodge: SETTINGS.dodge, punch: SETTINGS.punch, dead: SETTINGS.dead, anim: SETTINGS.anim })); } catch (e) {} }
 
 function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
 function lerp(a, b, t) { return a + (b - a) * t; }
@@ -1998,7 +2009,7 @@ function stepGame(G, dt, input, fx) {
   G.dbg = input.getDebug ? input.getDebug() : null;
   if (G.dbg && G.dup0 == null) G.dup0 = G.dbg.dup || 0;
   var k14 = Math.min(1, dt * 14), k20 = Math.min(1, dt * 20);
-  var dx = (ub.x - p.x) * (1 - Math.exp(-dt * 20)), lim = 1500 * dt;       // smooth, never teleports: eased and speed-limited
+  var dx = (ub.x - p.x) * (1 - Math.exp(-dt * 13)), lim = 1100 * dt;       // smooth, never teleports: eased and speed-limited
   p.x += clamp(dx, -lim, lim);
   // Gameplay dodge position is separate from the visual lean: the avatar always follows you, but you only leave the attack zone while a deliberate dodge (hysteresis flag) is active.
   var dsign = ub.dodge === 'R' ? 1 : ub.dodge === 'L' ? -1 : (ub.dodge === undefined && Math.abs(ub.x) >= 100 ? (ub.x > 0 ? 1 : -1) : 0);
@@ -2905,7 +2916,8 @@ function NetStatus(props) {
 
 function MainMenu(props) {
   var loading = props.k3 === 'loading' || props.k3 === 'idle';
-  return h('div', { className: 'screen fit' },
+  return h('div', { className: 'screen fit', style: { position: 'relative' } },
+    h('button', { className: 'btn ghost tvbtn' + (props.tv ? ' on' : ''), 'data-hand': '1', 'aria-pressed': !!props.tv, 'aria-label': 'TV mode', onClick: props.onTv }, props.tv ? 'TV: ON' : 'TV'),
     h('h1', { className: 'logo sm' }, 'Motion Boxing'),
     h('div', { className: 'herowrap' }, h(HeroCanvas)),
     props.camOn ? h('div', { className: 'hint1' }, h('div', { className: 'pip-prev mini' }, h(Preview, { tracker: props.tracker, fixed: true })), h('p', { className: 'sub' }, 'Raise your RIGHT hand and hold the cursor over a button for a second.')) : null,
@@ -3417,6 +3429,14 @@ function App() {
   var s8 = useState('training'), gmode = s8[0], setGmode = s8[1];
   var s9 = useState(loadNetCfg), cfg = s9[0], setCfg = s9[1];
   var s10 = useState(null), mpRes = s10[0], setMpRes = s10[1];
+  var s11 = useState(function () { try { return localStorage.getItem('mb.tv') === '1'; } catch (e) { return false; } }), tv = s11[0], setTv = s11[1];
+  var s12 = useState(0), setVp = s12[1];
+  useEffect(function () {                                                      // follow rotation / resizing (landscape for a TV)
+    var f = function () { setVp(function (n) { return n + 1; }); };
+    window.addEventListener('resize', f); window.addEventListener('orientationchange', f);
+    return function () { window.removeEventListener('resize', f); window.removeEventListener('orientationchange', f); };
+  }, []);
+  function toggleTv() { var v = !tv; setTv(v); try { localStorage.setItem('mb.tv', v ? '1' : '0'); } catch (e) { } }
   var inviteRef = useRef(null); if (inviteRef.current === null) inviteRef.current = inviteCode();         // a friend's invite link: ?room=ABC234
   var netRef = useRef(null); if (!netRef.current) netRef.current = makeNet(cfg);
   var net = netRef.current;
@@ -3457,7 +3477,7 @@ function App() {
     onDebug: function () { tracker.releaseCamera(); setCamOn(false); setCalibrated(false); dbg.current.attach(); setMode('debug'); play('training'); }
   });
   else if (screen === 'calibration') body = h(Calibration, { tracker: tracker, onDone: function () { setCalibrated(true); setScreen(inviteRef.current ? 'room' : 'menu'); }, onBack: camOff });
-  else if (screen === 'menu') body = h(MainMenu, { tracker: tracker, camOn: camOn, k3: k3, onOnline: function () { setScreen('room'); }, onTraining: function () { play('training'); }, onSettings: function () { setScreen('settings'); } });
+  else if (screen === 'menu') body = h(MainMenu, { tracker: tracker, camOn: camOn, k3: k3, tv: tv, onTv: toggleTv, onOnline: function () { setScreen('room'); }, onTraining: function () { play('training'); }, onSettings: function () { setScreen('settings'); } });
   else if (screen === 'room') body = h(PrivateRoom, { key: 'r' + cfg.url + cfg.kind, net: net, autoJoin: inviteRef.current, onVsAi: inviteRef.current ? null : function () { netRef.current.close(); play('game'); }, onBack: function () { inviteRef.current = ''; netRef.current.close(); setScreen('menu'); } });
   else if (screen === 'lobby') body = h(Lobby, { net: net, onLeave: function () { netRef.current.leaveRoom(); setScreen('room'); } });
   else if (screen === 'mp') body = h(MpMatch, { key: 'mp', net: net, tracker: tracker, input: input, onLeave: function () { setScreen('room'); }, onEnd: function (r) { setMpRes(r); setScreen('mpresult'); } });
@@ -3466,7 +3486,13 @@ function App() {
   else if (screen === 'tutorial') body = h(Tutorial, { tracker: tracker, mode: 'settings', onDone: function () { setScreen('settings'); }, onProgress: function () { }, onBack: function () { setScreen('settings'); } });
   else if (screen === 'match') body = h(Match, { key: round, mode: gmode, tracker: tracker, input: input, debug: mode === 'debug', onQuit: home, onEnd: function (r) { setResult(r); setScreen('result'); } });
   else body = h(Result, { result: result, tracker: tracker, camOn: camOn && mode === 'camera', debug: mode === 'debug', onAgain: function () { play(); }, onHome: home });
-  return h(React.Fragment, null, body, howOpen ? h(HowTo, { onClose: function () { setHowOpen(false); } }) : null, cursorOn ? h(HandCursor, { tracker: tracker, lowOnly: screen === 'match' }) : null);
+  /* TV / landscape: the phone sideways (or TV mode on). Menus keep their portrait layout, scaled to the full height of the screen and centred on a blurred copy of the street photo,
+     so a TV mirror has no black bars. The match canvas is already full height; its camera preview moves to the side. */
+  var vw = window.innerWidth || 390, vh = window.innerHeight || 844, landscape = vw > vh * 1.15, stage = tv || landscape, full = screen === 'match' || screen === 'mp';
+  try { document.documentElement.classList.toggle('stage', !!stage); } catch (e) { }
+  var content = body;
+  if (stage && !full) { var sc = Math.min(vh / 700, vw / 390); content = h('div', { className: 'stagebox', style: { width: 390, height: 700, transform: 'scale(' + sc + ')', left: (vw - 390 * sc) / 2, top: (vh - 700 * sc) / 2 } }, body); }
+  return h(React.Fragment, null, stage && typeof ARENA_BG_B64 !== 'undefined' ? h('div', { className: 'stagebg', style: { backgroundImage: 'url(data:image/png;base64,' + ARENA_BG_B64 + ')' } }) : null, stage && !landscape ? h('div', { className: 'tvhint' }, 'TV MODE: turn your phone sideways (switch off Portrait Lock) so it fills the TV') : null, content, howOpen ? h(HowTo, { onClose: function () { setHowOpen(false); } }) : null, cursorOn ? h(HandCursor, { tracker: tracker, lowOnly: screen === 'match' }) : null);
 }
 
 window.__MB = { UI: { App: App, MainMenu: MainMenu, PrivateRoom: PrivateRoom, Lobby: Lobby, SettingsScreen: SettingsScreen, HowTo: HowTo, NetStatus: NetStatus, Permission: Permission, Calibration: Calibration, Tutorial: Tutorial, Match: Match, SyncTest: SyncTest, MpMatch: MpMatch, MpResult: MpResult, mpHit: mpHit, Result: Result, DevPanel: DevPanel, MStatus: MStatus, VisPips: VisPips, HandCursor: HandCursor, HandHint: HandHint, MirrorCanvas: MirrorCanvas, HeroCanvas: HeroCanvas }, makeBackground: makeBackground, KRig: KRig, K3: K3, drawScene: drawScene, SETTINGS: SETTINGS, AnimMixer: AnimMixer, GestureEngine: GestureEngine, Tracker: Tracker, createGame: createGame, stepGame: stepGame, k3OptsRemote: k3OptsRemote, Pose: Pose, inviteCode: inviteCode, inviteUrl: inviteUrl, CFG: CFG, SilentFx: SilentFx, ATK: ATK };
