@@ -13,7 +13,7 @@ function createServer(opts) {
   const perIp = new Map();
   let nextId = 1;
   const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'content-type': 'text/plain' }); res.end('Motion Boxing server ok. rooms=' + Object.keys(rooms.rooms).length + ' clients=' + Object.keys(rooms.clients).length + ' pose=' + ((rooms.stats || {}).pose || 0) + ' punch=' + ((rooms.stats || {}).punch || 0) + ' v2\n');
+    res.writeHead(200, { 'content-type': 'text/plain' }); res.end('Motion Boxing server ok. rooms=' + Object.keys(rooms.rooms).length + ' clients=' + Object.keys(rooms.clients).length + ' pose=' + ((rooms.stats || {}).pose || 0) + ' punch=' + ((rooms.stats || {}).punch || 0) + ' v3\n');
   });
 
   function frame(op, buf) {
@@ -61,7 +61,8 @@ function createServer(opts) {
     socket.on('close', close); socket.on('error', close);
   });
   const timer = setInterval(() => rooms.sweep(), 5000); timer.unref();
-  server.rooms = rooms; server.stop = () => { clearInterval(timer); server.close(); };
+  const ticker = setInterval(() => rooms.tick(), 50); ticker.unref();          // the match clock: turns, stamina, punch resolution
+  server.rooms = rooms; server.stop = () => { clearInterval(timer); clearInterval(ticker); server.close(); };
   return server;
 }
 module.exports = { createServer };

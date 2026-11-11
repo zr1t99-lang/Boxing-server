@@ -272,12 +272,16 @@ details.dev ul { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direct
      {t:'error', code, msg}
      {t:'pong', n}
      {t:'pose' ...} / {t:'punch' ...}       the opponent's pose and punches, exactly as validated by the server
+     {t:'match', phase, you, cd, n, att, rem, hp:[a,b], st:[a,b], ctr:[a,b], el, winner, reason}   authoritative match state (about 10 per second)
+     {t:'hit', id, att, def, k, s, res:'hit'|'dodge'|'block'|'tired'|'offturn', dmg, ctr}          result of ONE punch, decided only by the server
+   The match starts by itself, with a countdown, as soon as both players are ready. The server owns the turn clock, stamina, health,
+   damage and the end of the match; clients only send their pose and their punch events and draw what the server says.
    Room state: 'lobby' (waiting / not everyone ready) | 'ready' (two players present, camera-ready and ready).
    A room never holds more than two players. */
 (function (root) {
   var ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';          // no 0/O/1/I so a code can be read out loud
   var CODE_RE = /^[A-HJ-NP-Z2-9]{6}$/;
-  var V = 2;                                                   // 2 = pose/punch relay
+  var V = 3;                                                   // 2 = pose/punch relay, 3 = authoritative multiplayer match
 
   var POSE_LEN = 18, POSE_LIM = 3000, KINDS = { jab: 1, cross: 1, hook: 1, upper: 1 };
   function validPose(p) {
@@ -286,11 +290,17 @@ details.dev ul { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direct
     return true;
   }
 
+  /* Approved Hybrid Boxing rules (same numbers as the solo game). Slot 0 attacks first, then the turns alternate every 5 seconds. */
+  var PUNCH = { jab: { st: 5, dmg: 5, zone: 'straight' }, cross: { st: 9, dmg: 9, zone: 'straight' }, hook: { st: 13, dmg: 12, zone: 'hook' }, upper: { st: 18, dmg: 16, zone: 'body' } };
+  var RULES = { countdownMs: 3500, turnMs: 5000, counterMs: 1300, resolveMs: 90, maxMs: 180000, regen: 12, regenDelayMs: 600, blockDrain: 3, dodgeCost: 5, low: 25, gapMs: 180, stateMs: 100, poseStaleMs: 1500, endKeepMs: 60000,
+    dodgeX: 0.65, dodgeLatchOn: 0.26, dodgeLatchOff: 0.11, duckAvoid: 0.52, blockDmg: 0.25, counterBonus: 1.25, tiredDmg: 0.6 };
+
   function RoomManager(opts) {
     opts = opts || {};
     this.rand = opts.rand || Math.random;
     this.now = opts.now || function () { return Date.now(); };
     this.staleMs = opts.staleMs || 20000;
+    this.autoStart = opts.autoStart !== false;       // the match begins by itself when both are ready (tests of the plain lobby switch this off)
     this.clients = {};            // id -> {id, send, room, name, cam, lastSeen}
     this.rooms = {};              // code -> {code, slots:[clientId|null, clientId|null], ready:{id:bool}, created}
   }
@@ -305,7 +315,7 @@ details.dev ul { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direct
     return null;
   };
   RoomManager.prototype.connect = function (id, send) {
-    this.clients[id] = { id: id, send: send, room: null, name: 'Player', cam: false, lastSeen: this.now(), poseAt: -1e9, punchAt: -1e9, lastQ: 0, lastPunchId: 0 };
+    this.clients[id] = { id: id, send: send, room: null, name: 'Player', cam: false, lastSeen: this.now(), poseAt: -1e9, punchAt: -1e9, lastQ: 0, lastPunchId: 0, pose: null };
     this.stats = this.stats || { pose: 0, punch: 0, dropped: 0, dupPunch: 0 };
     send({ t: 'welcome', id: id, v: V });
   };
@@ -320,7 +330,8 @@ details.dev ul { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direct
       players.push({ slot: slot, name: p ? p.name : 'Player', connected: !!p, cam: !!(p && p.cam), ready: !!room.ready[pid] });
     });
     var both = players.length === 2 && players.every(function (p) { return p.connected && p.cam && p.ready; });
-    return { t: 'room', code: room.code, you: you, state: both ? 'ready' : 'lobby', players: players };
+    var playing = !!(room.match && room.match.phase !== 'ended');
+    return { t: 'room', code: room.code, you: you, state: playing ? 'playing' : both ? 'ready' : 'lobby', playing: playing, players: players };
   };
   RoomManager.prototype.broadcast = function (room) {
     var self = this;
@@ -330,10 +341,12 @@ details.dev ul { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direct
   RoomManager.prototype.removeFromRoom = function (cl, notifySelf) {
     var room = cl.room && this.rooms[cl.room]; cl.room = null;
     if (!room) return;
-    var i = room.slots.indexOf(cl.id); if (i >= 0) room.slots[i] = null; delete room.ready[cl.id];
+    var i = room.slots.indexOf(cl.id);
+    if (room.match && room.match.phase !== 'ended' && i >= 0) this.endMatch(room, 1 - i, 'left');             // leaving or losing the connection mid-match forfeits it
+    if (i >= 0) room.slots[i] = null; delete room.ready[cl.id];
     if (!room.slots[0] && room.slots[1]) { room.slots[0] = room.slots[1]; room.slots[1] = null; }       // the remaining player becomes slot 0
     if (!room.slots[0]) { delete this.rooms[room.code]; }
-    else { room.ready = {}; this.broadcast(room); }                                                     // someone left: everybody has to ready up again
+    else { room.ready = {}; room.match = null; this.broadcast(room); }                                                     // someone left: everybody has to ready up again
     if (notifySelf) cl.send({ t: 'left' });
   };
 
@@ -365,8 +378,11 @@ details.dev ul { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direct
         if (!room) return this.err(cl, 'not_in_room', 'You are not in a room');
         if (msg.ready && !cl.cam) return this.err(cl, 'cam_not_ready', 'Your camera tracking is not ready yet');
         if (msg.ready && !(room.slots[0] && room.slots[1])) return this.err(cl, 'alone', 'Wait for your opponent to join');
+        if (room.match && room.match.phase !== 'ended') return;                                    // no changes while a match is running
         if (msg.ready) room.ready[id] = true; else delete room.ready[id];
-        return this.broadcast(room);
+        this.broadcast(room);
+        if (this.autoStart && this.snapshot(room, id).state === 'ready') this.startMatch(room);                       // both ready: the match begins by itself
+        return;
       }
       case 'pose': case 'punch': return this.relay(cl, room, msg);
       case 'leave': return this.removeFromRoom(cl, true);
@@ -383,7 +399,7 @@ details.dev ul { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direct
     if (msg.t === 'pose') {
       if (!validPose(msg.p) || !(msg.q > 0) || Math.floor(msg.q) !== msg.q || typeof msg.ts !== 'number' || !isFinite(msg.ts) || msg.q <= cl.lastQ) { st.dropped++; return; }
       if (t - cl.poseAt < 25) { st.dropped++; return; }                          // at most 40 poses per second per player
-      cl.poseAt = t; cl.lastQ = msg.q; st.pose++;
+      cl.poseAt = t; cl.lastQ = msg.q; cl.pose = msg.p; st.pose++;
       return other.send({ t: 'pose', q: msg.q, ts: msg.ts, p: msg.p });
     }
     if (!(msg.id > 0) || Math.floor(msg.id) !== msg.id || (msg.s !== 'R' && msg.s !== 'L') || !KINDS[msg.k] || typeof msg.ts !== 'number' || !isFinite(msg.ts)) { st.dropped++; return; }
@@ -391,6 +407,90 @@ details.dev ul { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direct
     if (t - cl.punchAt < 80) { st.dropped++; return; }
     cl.punchAt = t; cl.lastPunchId = msg.id; st.punch++;
     other.send({ t: 'punch', id: msg.id, ts: msg.ts, s: msg.s, k: msg.k });
+    if (room.match && room.match.phase === 'fight') this.matchPunch(cl, room, msg);
+  };
+
+  /* ---------------- authoritative match ---------------- */
+  RoomManager.prototype.startMatch = function (room) {
+    var t = this.now();
+    room.match = { phase: 'countdown', t0: t, fightT0: 0, turnT0: 0, n: 0, last: t, hp: [100, 100], st: [100, 100], stAt: [0, 0], ctr: [0, 0], gapAt: [-1e9, -1e9], latch: [false, false], pend: [], lastState: 0, winner: -1, reason: '', endAt: 0,
+      stats: [{ swings: 0, hits: 0, dodges: 0, blocks: 0, taken: 0 }, { swings: 0, hits: 0, dodges: 0, blocks: 0, taken: 0 }] };
+    this.broadcast(room);                                                              // the room is now 'playing'
+    this.sendMatch(room);
+  };
+  RoomManager.prototype.matchSnapshot = function (room, slot) {
+    var m = room.match, t = this.now(), fight = m.phase === 'fight', r1 = function (v) { return Math.round(v * 10) / 10; };
+    return { t: 'match', phase: m.phase, you: slot, cd: m.phase === 'countdown' ? Math.max(0, RULES.countdownMs - (t - m.t0)) : 0, n: m.n, att: m.n % 2, rem: fight ? Math.max(0, RULES.turnMs - (t - m.turnT0)) : RULES.turnMs,
+      hp: [r1(m.hp[0]), r1(m.hp[1])], st: [r1(m.st[0]), r1(m.st[1])], ctr: [Math.max(0, m.ctr[0] - t), Math.max(0, m.ctr[1] - t)], el: fight || m.phase === 'ended' ? Math.max(0, (m.endAt || t) - m.fightT0) : 0,
+      winner: m.winner, reason: m.reason, stats: m.phase === 'ended' ? m.stats : undefined };
+  };
+  RoomManager.prototype.sendMatch = function (room) {
+    var self = this; room.match.lastState = this.now();
+    room.slots.forEach(function (pid, slot) { var cl = pid && self.clients[pid]; if (cl) cl.send(self.matchSnapshot(room, slot)); });
+  };
+  RoomManager.prototype.endMatch = function (room, winner, reason) {
+    var m = room.match; if (!m || m.phase === 'ended') return;
+    m.phase = 'ended'; m.winner = winner; m.reason = reason; m.endAt = this.now(); m.pend = [];
+    this.sendMatch(room);
+    room.ready = {};                                                                  // everybody has to ready up again for a rematch
+    this.broadcast(room);
+  };
+  function blockingOf(p) { return !!p && !(p[5] & 8) && ((p[5] & 4) || p[4] >= 50); }
+  RoomManager.prototype.poseOf = function (room, slot) {
+    var cl = this.clients[room.slots[slot]]; if (!cl || !cl.pose || this.now() - cl.poseAt > RULES.poseStaleMs) return null;   // no recent signal: the fighter can neither dodge nor block
+    return cl.pose;
+  };
+  /* one punch event from slot a. Validates the turn, the counter window and the stamina; the outcome is decided RULES.resolveMs later from the defender's pose. */
+  RoomManager.prototype.matchPunch = function (cl, room, msg) {
+    var m = room.match, t = this.now(), a = room.slots.indexOf(cl.id), d = 1 - a, pt = PUNCH[msg.k], st = m.stats[a];
+    if (a < 0 || !pt || t - m.gapAt[a] < RULES.gapMs) return;
+    var mine = (m.n % 2) === a, counter = !mine && m.ctr[a] > t;
+    var base = { t: 'hit', id: msg.id, att: a, def: d, k: msg.k, s: msg.s, dmg: 0, ctr: false };
+    if (!mine && !counter) return cl.send(Object.assign(base, { res: 'offturn' }));          // defend turn and no counter window: the punch does nothing and costs nothing
+    if (m.st[a] < pt.st) return cl.send(Object.assign(base, { res: 'tired' }));              // exhausted: no damage, no cost, a counter window is kept
+    if (counter) m.ctr[a] = 0;                                                               // a counter window pays for exactly one punch
+    m.st[a] -= pt.st; m.stAt[a] = t; m.gapAt[a] = t; st.swings++;
+    m.pend.push({ at: t + RULES.resolveMs, a: a, d: d, id: msg.id, k: msg.k, s: msg.s, counter: counter });
+  };
+  RoomManager.prototype.resolvePunch = function (room, p) {
+    var m = room.match, pt = PUNCH[p.k], t = this.now(), pd = this.poseOf(room, p.d), res, dmg = 0;
+    var avX = !!pd && Math.abs(pd[16]) / 100 > RULES.dodgeX, avY = !!pd && pd[1] / 100 > RULES.duckAvoid;
+    var avoid = pt.zone === 'straight' ? (avX || avY) : pt.zone === 'hook' ? avY : avX;                  // sidestep, duck or both, depending on the punch (the solo game's attack zones)
+    var base = pt.dmg * (m.st[p.a] < RULES.low ? RULES.tiredDmg : 1);
+    if (avoid) { res = 'dodge'; m.stats[p.d].dodges++; m.ctr[p.d] = t + RULES.counterMs; }              // a successful dodge opens the counter-punch window
+    else if (blockingOf(pd) && m.st[p.d] > 0) { res = 'block'; dmg = base * RULES.blockDmg; m.stats[p.d].blocks++; }
+    else { res = 'hit'; dmg = base * (p.counter ? RULES.counterBonus : 1); m.stats[p.a].hits++; m.stats[p.d].taken++; }
+    m.hp[p.d] = Math.max(0, m.hp[p.d] - dmg);
+    var ev = { t: 'hit', id: p.id, att: p.a, def: p.d, k: p.k, s: p.s, res: res, dmg: Math.round(dmg * 10) / 10, ctr: p.counter };
+    var self = this; room.slots.forEach(function (pid) { var cl = pid && self.clients[pid]; if (cl) cl.send(ev); });
+    this.sendMatch(room);
+    if (m.hp[p.d] <= 0) this.endMatch(room, p.a, 'ko');
+  };
+  RoomManager.prototype.tick = function () {
+    var t = this.now(), code, room, m, i;
+    for (code in this.rooms) {
+      room = this.rooms[code]; m = room.match; if (!m) continue;
+      if (m.phase === 'ended') { if (t - m.endAt > RULES.endKeepMs) room.match = null; continue; }
+      if (m.phase === 'countdown') {
+        if (t - m.t0 >= RULES.countdownMs) { m.phase = 'fight'; m.fightT0 = t; m.turnT0 = t; m.last = t; this.sendMatch(room); }
+        else if (t - m.lastState >= RULES.stateMs) this.sendMatch(room);
+        continue;
+      }
+      var dt = Math.max(0, Math.min(0.25, (t - m.last) / 1000)); m.last = t;
+      var flipped = false; while (t - m.turnT0 >= RULES.turnMs) { m.turnT0 += RULES.turnMs; m.n++; flipped = true; }       // exactly five seconds each, then it flips with no pause
+      for (i = m.pend.length - 1; i >= 0; i--) if (m.pend[i].at <= t) { var pp = m.pend.splice(i, 1)[0]; this.resolvePunch(room, pp); if (m.phase === 'ended') break; }
+      if (m.phase === 'ended') continue;
+      for (i = 0; i < 2; i++) {
+        var pose = this.poseOf(room, i), blocking = blockingOf(pose);
+        if (blocking && m.st[i] > 0) { m.st[i] = Math.max(0, m.st[i] - RULES.blockDrain * dt); m.stAt[i] = t; }
+        if (t - m.stAt[i] >= RULES.regenDelayMs && !(blocking && m.st[i] > 0)) m.st[i] = Math.min(100, m.st[i] + RULES.regen * dt);
+        var gx = pose ? Math.abs(pose[16]) / 100 : 0;
+        if (!m.latch[i] && gx > RULES.dodgeLatchOn) { m.latch[i] = true; m.st[i] = Math.max(0, m.st[i] - RULES.dodgeCost); m.stAt[i] = t; }     // every deliberate dodge costs stamina
+        else if (m.latch[i] && gx < RULES.dodgeLatchOff) m.latch[i] = false;
+      }
+      if (t - m.fightT0 >= RULES.maxMs) { var h0 = m.hp[0], h1 = m.hp[1]; return this.endMatch(room, h0 === h1 ? -1 : h0 > h1 ? 0 : 1, 'time'); }
+      if (flipped || t - m.lastState >= RULES.stateMs) this.sendMatch(room);
+    }
   };
 
   RoomManager.prototype.disconnect = function (id) {
@@ -405,6 +505,7 @@ details.dev ul { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direct
     return dead;
   };
 
+  RoomManager.RULES = RULES; RoomManager.PUNCH = PUNCH;
   root.RoomManager = RoomManager;
   if (typeof module !== 'undefined' && module.exports) module.exports = RoomManager;
 })(typeof self !== 'undefined' ? self : globalThis);
@@ -447,6 +548,7 @@ details.dev ul { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direct
   Net.prototype._clearTimers = function () { this._timers.forEach(function (t) { clearTimeout(t); clearInterval(t); }); this._timers = []; };
   Net.prototype._deliver = function (msg) {
     if (msg.t === 'welcome') this.serverV = msg.v || 1;
+    if (msg.t === 'match') this.matchState = msg;
     if (msg.t === 'room') this.room = msg;
     else if (msg.t === 'left') this.room = null;
     else if (msg.t === 'pong' && msg.n && this._pingAt && this._pingAt[msg.n]) { this.rtt = Date.now() - this._pingAt[msg.n]; delete this._pingAt[msg.n]; }
@@ -464,7 +566,7 @@ details.dev ul { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direct
     this._clearTimers();
     if (this.ws) { try { this.ws.onclose = null; this.ws.close(); } catch (e) { } this.ws = null; }
     if (this.chan) { try { this.chan.postMessage({ k: 'bye', from: this.id }); this.chan.close(); } catch (e) { } this.chan = null; }
-    this.rm = null; this.room = null;
+    this.rm = null; this.room = null; this.matchState = null;
     if (!quiet) this._setState('offline', '');
   };
 
@@ -508,6 +610,7 @@ details.dev ul { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direct
     this.chan.onmessage = function (e) { self._mockRx(e.data); };
     this._setState('online');
     this._deliver({ t: 'welcome', id: this.id, v: 2, mock: true });
+    this._every(function () { if (self.rm) self.rm.tick(); }, 50);                     // the tab that hosts a local test room also runs the match clock
     this._every(function () {
       if (self.rm) self.chan.postMessage({ k: 'hb', from: self.id });
       else if (self.room && Date.now() - self._hubSeen > 7000) { self.room = null; self._emit({ type: 'msg', msg: { t: 'left' } }); self._emit({ type: 'msg', msg: { t: 'error', code: 'host_lost', msg: 'The tab that hosts this room was closed' } }); }
@@ -1700,6 +1803,7 @@ function k3OptsRemote(G, time) {
   ['R', 'L'].forEach(function (sd) { var a = P[sd]; o.arms[sd] = { wx: a.wx, wy: a.wy, ex: a.ex, ey: a.ey, w: lost ? 0 : a.w }; });     // lost signal: arms relax to the guard
   punchBody(o, time, S);
   if (o.block > 0.02) o.acc.push({ name: 'block', t: 0, w: o.block * 0.6 });
+  if (S.hit) { var hac = rig.acc.hit, htt = time - S.hit.t0; if (htt >= 0 && htt < hac.dur) o.acc.push({ name: 'hit', t: htt, w: 0.9 * Math.min(1, htt / 0.05) * (1 - htt / hac.dur) }); else if (htt >= hac.dur) S.hit = null; }       // the server said this punch landed
   ['R', 'L'].forEach(function (sd) {
     var kd = S.kind[sd], bt = time - S.boost[sd];
     if (bt >= 0 && bt < 0.45 && (kd === 'jab' || kd === 'cross' || kd === 'hook')) { var nm = kd === 'hook' ? 'hook' : (sd === 'L' ? 'jabL' : 'jabR'), ac = rig.acc[nm]; if (bt < ac.dur) o.acc.push({ name: nm, t: bt, w: 0.45 * KIND[kd].clip * Math.sin(bt / ac.dur * Math.PI) }); }
@@ -2364,10 +2468,11 @@ function hpColors(hp) {
 var FACE = { img: null };
 function loadFace() { if (FACE.img || typeof FACE_B64 === 'undefined') return; var im = new Image(); im.onload = function () { FACE.img = im; }; im.src = 'data:image/png;base64,' + FACE_B64; }
 function hexPath(ctx, cx, cy, rx, ry) { ctx.beginPath(); ctx.moveTo(cx - rx, cy); ctx.lineTo(cx - rx / 2, cy - ry); ctx.lineTo(cx + rx / 2, cy - ry); ctx.lineTo(cx + rx, cy); ctx.lineTo(cx + rx / 2, cy + ry); ctx.lineTo(cx - rx / 2, cy + ry); ctx.closePath(); }
+var HUDN = null;                                                   // multiplayer: the two fighters' names on the health bars (null = the solo names)
 var BAR = { y: 53, h: 25, x0: 46, x1: 208 };
 /* One fighter's health bar. side 'L' = Khalid (shrinks toward the left/outer edge), 'R' = AI Khalid (mirrored). The fill is the smoothed value, so damage drains away smoothly. */
 function drawHealth(ctx, side, hp, show) {
-  var R = side === 'R', y = BAR.y, h = BAR.h, x0 = BAR.x0, x1 = BAR.x1, len = x1 - x0, f = clamp(show, 0, 100) / 100, name = R ? 'AI KHALID' : 'KHALID';
+  var R = side === 'R', y = BAR.y, h = BAR.h, x0 = BAR.x0, x1 = BAR.x1, len = x1 - x0, f = clamp(show, 0, 100) / 100, name = HUDN ? HUDN[side] : R ? 'AI KHALID' : 'KHALID';
   ctx.save(); if (R) { ctx.translate(W, 0); ctx.scale(-1, 1); }                       // draw the left design, mirror it for the right
   var sl = 8;                                                                          // slanted inner end
   function poly() { ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.lineTo(x1 - sl, y + h); ctx.lineTo(x0, y + h); ctx.closePath(); }
@@ -2506,7 +2611,7 @@ function drawHUD(ctx, G, time) {
   drawStam(ctx, 'L', G.pSt, G.pSt < STAM.low, time); drawStam(ctx, 'R', G.aSt, G.aSt < STAM.low, time);
   if (SETTINGS.dev) drawDev(ctx, G);
   drawAnnounce(ctx, G); drawTurnTimer(ctx, G);
-  if (G.phase === 'ended') { textOutlined(ctx, G.endLabel || 'K.O.!', 240, H / 2 - 60, 72 + Math.min(20, G.endT * 40), '#ffc42e', 1); textOutlined(ctx, G.result && G.result.outcome === 'win' ? 'YOU WIN' : 'YOU LOSE', 240, H / 2 + 10, 34, '#fff', 1); }
+  if (G.phase === 'ended') { textOutlined(ctx, G.endLabel || 'K.O.!', 240, H / 2 - 60, 72 + Math.min(20, G.endT * 40), '#ffc42e', 1); textOutlined(ctx, G.result && G.result.outcome === 'win' ? 'YOU WIN' : G.result && G.result.outcome === 'draw' ? 'DRAW' : 'YOU LOSE', 240, H / 2 + 10, 34, '#fff', 1); }
   ctx.font = '12px ' + FONT; ctx.fillStyle = '#f3f5ff';
   ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
   ctx.fillText('PUNCHES ' + G.hits + '/' + G.swings + '   DODGES ' + G.dodges + '   BLOCKS ' + G.blocks + '   HITS TAKEN ' + G.taken, 240, 114);
@@ -2761,15 +2866,19 @@ function HowTo(props) {
 
 /* ---------- launch flow, main menu, online menu, private rooms, settings ---------- */
 var NETCFG_KEY = 'mb.net';
-var DEFAULT_SERVER_URL = '';          // fill in after the game server is deployed, e.g. 'wss://motion-boxing.example.com'
-function loadNetCfg() {
-  var c = { kind: DEFAULT_SERVER_URL ? 'ws' : 'none', url: DEFAULT_SERVER_URL, name: '' };
-  try { var j = JSON.parse(localStorage.getItem(NETCFG_KEY) || 'null'); if (j && typeof j === 'object') { c.kind = j.kind === 'ws' || j.kind === 'mock' ? j.kind : 'none'; c.url = typeof j.url === 'string' ? j.url : c.url; c.name = typeof j.name === 'string' ? j.name : ''; } } catch (e) { }
-  try { var q = /[?&]server=([^&]+)/.exec(location.search); if (q) { c.url = decodeURIComponent(q[1]); c.kind = 'ws'; } if (/[?&]mock=1/.test(location.search)) c.kind = 'mock'; } catch (e) { }
+var DEFAULT_SERVER_URL = 'wss://boxing-server.onrender.com';          // the deployed game server; players never have to enter anything
+function loadNetCfg() {                 // the server is fixed for players. Only the display name is remembered. ?server=wss://... and ?mock=1 stay available for developers.
+  var c = { kind: 'ws', url: DEFAULT_SERVER_URL, name: '' };
+  try { var j = JSON.parse(localStorage.getItem(NETCFG_KEY) || 'null'); if (j && typeof j === 'object' && typeof j.name === 'string') c.name = j.name.slice(0, 14); } catch (e) { }
+  try { var q = /[?&]server=([^&]+)/.exec(location.search); if (q) c.url = decodeURIComponent(q[1]); if (/[?&]mock=1/.test(location.search)) c.kind = 'mock'; } catch (e) { }
   return c;
 }
-function saveNetCfg(c) { try { localStorage.setItem(NETCFG_KEY, JSON.stringify({ kind: c.kind, url: c.url, name: c.name })); } catch (e) { } }
-function makeNet(c) { return new Net({ kind: c.kind, url: c.url, name: (c.name || 'Player').slice(0, 14) }); }
+function saveNetCfg(c) { try { localStorage.setItem(NETCFG_KEY, JSON.stringify({ name: c.name })); } catch (e) { } }
+function inviteCode() { try { var m = /[?&]room=([A-Za-z0-9]+)/.exec(location.search); var c = m ? RoomManager.normalizeCode(m[1]) : ''; return RoomManager.isValidCode(c) ? c : ''; } catch (e) { return ''; } }
+function inviteUrl(code) { try { return location.origin + location.pathname.replace(/index\.html$/, '') + '?room=' + code; } catch (e) { return ''; } }
+/* the free host puts the server to sleep when nobody plays: knock on its door as soon as the page opens so it is awake by the time the player gets to a room */
+function warmServer(c) { try { if (c.kind === 'ws' && /^wss:\/\//.test(c.url) && typeof fetch === 'function') fetch(c.url.replace(/^wss:/, 'https:'), { mode: 'no-cors', cache: 'no-store' }).catch(function () { }); } catch (e) { } }
+function makeNet(c) { return new Net({ kind: c.kind, url: c.url, name: (c.name || 'Player').slice(0, 14), connectTimeoutMs: 45000 }); }
 
 /* re-render when the connection or the room changes; remembers the last server error for the banner */
 function useNet(net) {
@@ -2788,9 +2897,9 @@ function NetStatus(props) {
   var net = props.net, st = net.state, cls = st === 'online' ? 'ok' : st === 'connecting' ? 'info' : st === 'error' ? 'bad' : 'warn';
   var label = st === 'online' ? (net.kind === 'mock' ? 'LOCAL TEST MODE' : 'CONNECTED') : st === 'connecting' ? 'CONNECTING…' : st === 'error' ? 'NOT CONNECTED' : net.kind === 'none' ? 'NO SERVER SET UP' : 'NOT CONNECTED';
   var text = st === 'online' ? (net.kind === 'mock' ? 'Rooms only work between tabs of this browser on this device. This is not online play.' : 'Connected to the game server.')
-    : st === 'connecting' ? 'Reaching the game server…'
+    : st === 'connecting' ? 'Connecting to the game server. The first time can take up to a minute while it wakes up.'
     : st === 'error' ? (net.error || 'Could not connect.')
-    : net.kind === 'none' ? 'No online server is set up yet. Add one in SETTINGS, or use LOCAL TEST MODE to try rooms between two tabs on this device.' : 'Not connected.';
+    : 'Not connected.';
   return h('div', { className: 'topmsg' }, h('div', { className: 'row between' }, h('span', { className: 'chip ' + cls, role: 'status' }, label), props.right || null), h('p', { className: 'sub', style: { fontSize: 13 } }, text));
 }
 
@@ -2808,29 +2917,19 @@ function MainMenu(props) {
           h('button', { className: 'btn big', 'data-hand': '1', style: { background: '#2a3a8f', boxShadow: '0 6px 0 #1a2566' }, onClick: props.onSettings }, h('span', null, 'SETTINGS'))));
 }
 
-function OnlineMenu(props) {
-  var net = props.net, ui = useNet(net);
-  useEffect(function () { if (net.state === 'offline' && net.kind !== 'none') net.connect(); }, [net]);
-  return h('div', { className: 'screen fit' },
-    h('h2', { className: 'title' }, 'Play online'),
-    h(NetStatus, { net: net, right: net.state === 'error' ? h('button', { className: 'btn ghost sm', 'data-hand': '1', onClick: function () { net.connect(); } }, 'RETRY') : null }),
-    h('div', { className: 'modes' },
-      h('button', { className: 'btn big dim', disabled: true }, h('span', null, 'RANDOM MATCH'), h('small', null, 'Next stage: matchmaking is not built yet')),
-      h('button', { className: 'btn gold big', 'data-hand': '1', onClick: props.onPrivate }, h('span', null, 'PRIVATE ROOM'), h('small', null, 'Create or join a room with a code')),
-      h('button', { className: 'btn big', 'data-hand': '1', style: { background: '#2a3a8f', boxShadow: '0 6px 0 #1a2566' }, onClick: props.onVsAi }, h('span', null, 'VS AI (OFFLINE)'), h('small', null, 'Real match against the computer'))),
-    h('div', { className: 'spacer' }),
-    h('div', { className: 'row' }, h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: props.onBack }, 'BACK')));
-}
-
+/* PLAY ONLINE: create a room, or join one with a code (or through an invite link). Nothing else. */
 function PrivateRoom(props) {
-  var net = props.net, ui = useNet(net), js = useState(false), joining = js[0], setJoining = js[1], cs = useState(''), code = cs[0], setCode = cs[1];
+  var net = props.net, ui = useNet(net), js = useState(!!props.autoJoin), joining = js[0], setJoining = js[1], cs = useState(props.autoJoin || ''), code = cs[0], setCode = cs[1], tried = useRef(false);
   useEffect(function () { if (net.state === 'offline' && net.kind !== 'none') net.connect(); }, [net]);
   var online = net.state === 'online', valid = RoomManager.isValidCode(RoomManager.normalizeCode(code));
+  useEffect(function () { if (props.autoJoin && online && tried.current !== net) { tried.current = net; net.joinRoom(props.autoJoin); } }, [online, net]);
+  var autoJoining = !!props.autoJoin && tried.current === net && !ui.err && !net.room;
   return h('div', { className: 'screen fit' },
-    h('h2', { className: 'title' }, 'Private room'),
-    h(NetStatus, { net: net, right: net.state === 'error' ? h('button', { className: 'btn ghost sm', 'data-hand': '1', onClick: function () { net.connect(); } }, 'RETRY') : null }),
+    h('h2', { className: 'title' }, 'Play online'),
+    h(NetStatus, { net: net, right: net.state === 'error' ? h('button', { className: 'btn ghost sm', 'data-hand': '1', onClick: function () { tried.current = null; net.connect(); } }, 'RETRY') : null }),
     ui.err ? h('div', { className: 'topmsg', role: 'alert', style: { borderColor: 'rgba(255,59,79,.6)' } }, h('p', { className: 'msg', style: { color: 'var(--red)', fontSize: 16 } }, ui.err)) : null,
-    online ? (joining
+    autoJoining ? h('p', { className: 'msg', style: { textAlign: 'center' } }, 'Joining room ' + props.autoJoin + '…') : null,
+    online && !autoJoining ? (joining
       ? h('div', { className: 'card slim' },
           h('label', { className: 'fld' }, h('span', null, 'Room code'),
             h('input', { type: 'text', className: 'code', value: code, maxLength: 6, autoCapitalize: 'characters', autoCorrect: 'off', autoComplete: 'off', spellCheck: false, inputMode: 'text', placeholder: 'ABC234', onChange: function (e) { setCode(RoomManager.normalizeCode(e.target.value).slice(0, 6)); ui.clear(); } })),
@@ -2838,11 +2937,10 @@ function PrivateRoom(props) {
             h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: function () { setJoining(false); ui.clear(); } }, 'CANCEL'),
             h('button', { className: 'btn gold grow', 'data-hand': '1', disabled: !valid, onClick: function () { net.joinRoom(code); } }, 'JOIN')))
       : h('div', { className: 'modes' },
-          h('button', { className: 'btn gold big', 'data-hand': '1', onClick: function () { net.createRoom(); } }, h('span', null, 'CREATE ROOM'), h('small', null, 'You get a six-character code to share')),
-          h('button', { className: 'btn big', 'data-hand': '1', onClick: function () { setJoining(true); } }, h('span', null, 'JOIN ROOM'), h('small', null, 'Enter the code your friend sent'))))
-      : net.kind === 'none' ? h('button', { className: 'btn gold', 'data-hand': '1', onClick: props.onSettings }, 'OPEN SETTINGS') : null,
+          h('button', { className: 'btn gold big', 'data-hand': '1', onClick: function () { net.createRoom(); } }, h('span', null, 'CREATE ROOM'), h('small', null, 'Get a code and a link to send to your friend')),
+          h('button', { className: 'btn big', 'data-hand': '1', onClick: function () { setJoining(true); } }, h('span', null, 'JOIN ROOM'), h('small', null, 'Enter the code your friend sent')))) : null,
     h('div', { className: 'spacer' }),
-    h('div', { className: 'row' }, h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: props.onBack }, 'BACK')));
+    h('div', { className: 'row' }, h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: props.onBack }, 'BACK'), props.onVsAi ? h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: props.onVsAi }, 'VS AI (OFFLINE)') : null));
 }
 
 function PlayerCard(props) {
@@ -2855,33 +2953,32 @@ function PlayerCard(props) {
     h('span', { className: 'chip ' + (p.ready ? 'ok' : 'info') }, p.ready ? 'READY' : 'NOT READY'));
 }
 function Lobby(props) {
-  var net = props.net, ui = useNet(net), room = net.room, cs = useState(''), note = cs[0], setNote = cs[1], os = useState(0), oppSync = os[0], setOppSync = os[1];
-  useEffect(function () { return net.on(function (e) { if (e.type === 'msg' && e.msg.t === 'pose') setOppSync(Date.now()); }); }, [net]);
-  useEffect(function () { if (!oppSync) return; var id = setTimeout(function () { setOppSync(0); }, 2500); return function () { clearTimeout(id); }; }, [oppSync]);
+  var net = props.net, ui = useNet(net), room = net.room, cs = useState(''), note = cs[0], setNote = cs[1];
   if (!room) return h('div', { className: 'screen fit' }, h('p', { className: 'sub' }, 'Leaving the room…'));
   var me = room.players.filter(function (p) { return p.slot === room.you; })[0], other = room.players.filter(function (p) { return p.slot !== room.you; })[0];
-  var syncOk = !!(room.players.length === 2 && other && other.connected && me && me.cam && net.state === 'online' && net.supportsPose());
-  var both = room.state === 'ready', canReady = !!(me && me.cam && other), msg = both ? 'Both players are ready.' : !other ? 'Share this code with your opponent. Only two players fit in a room.' : !me.cam ? 'Your camera tracking is not ready. Show your shoulders and both hands.' : me.ready ? 'Waiting for your opponent to get ready…' : 'Press READY when you are in position.';
-  function copy() {
-    var done = function () { setNote('Code copied'); setTimeout(function () { setNote(''); }, 1500); };
-    try { if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(room.code).then(done, function () { setNote('Press and hold the code to copy'); }); return; } } catch (e) { }
-    setNote('Press and hold the code to copy');
+  var both = room.state === 'ready' || room.state === 'playing', canReady = !!(me && me.cam && other), link = inviteUrl(room.code);
+  var msg = both ? 'Both players are ready. The fight is starting…' : !other ? 'Send the link or the code to your friend. Only two players fit in a room.' : !me.cam ? 'Your camera tracking is not ready. Show your shoulders and both hands.' : me.ready ? 'Waiting for your opponent to get ready.' : other.ready ? 'Your opponent is ready. Press READY to fight.' : 'Press READY when you are set. The fight starts when both players are ready.';
+  function copyText(txt, ok) {
+    var done = function () { setNote(ok); setTimeout(function () { setNote(''); }, 1800); };
+    try { if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(txt).then(done, function () { setNote('Press and hold the link to copy'); }); return; } } catch (e) { }
+    setNote('Press and hold the link to copy');
+  }
+  function invite() {                                    // the phone's share sheet when available, otherwise copy the link
+    var text = 'Join my Motion Boxing room ' + room.code;
+    try { if (navigator.share) { navigator.share({ title: 'Motion Boxing', text: text, url: link }).catch(function () { copyText(link, 'Link copied'); }); return; } } catch (e) { }
+    copyText(link, 'Link copied');
   }
   return h('div', { className: 'screen fit' },
     h('div', { className: 'topmsg' },
       h('div', { className: 'kicker' }, net.kind === 'mock' ? 'ROOM CODE  (LOCAL TEST MODE: THIS DEVICE ONLY)' : 'ROOM CODE'),
       h('div', { className: 'roomcode', 'aria-label': 'Room code ' + room.code.split('').join(' ') }, room.code),
-      h('div', { className: 'row between' }, h('button', { className: 'btn ghost sm', 'data-hand': '1', onClick: copy }, 'COPY CODE'), h('span', { className: 'sub', style: { fontSize: 12 } }, note))),
+      h('div', { className: 'row' }, h('button', { className: 'btn gold sm grow', 'data-hand': '1', onClick: invite }, 'INVITE FRIEND'), h('button', { className: 'btn ghost sm grow', 'data-hand': '1', onClick: function () { copyText(room.code, 'Code copied'); } }, 'COPY CODE')),
+      h('div', { className: 'sub', style: { fontSize: 11, userSelect: 'text', WebkitUserSelect: 'text', wordBreak: 'break-all' } }, note || link)),
     ui.err ? h('div', { className: 'topmsg', role: 'alert', style: { borderColor: 'rgba(255,59,79,.6)' } }, h('p', { className: 'msg', style: { color: 'var(--red)', fontSize: 15 } }, ui.err)) : null,
     h('div', { className: 'pcards' }, h(PlayerCard, { p: me, me: true }), h(PlayerCard, { p: other, me: false })),
     h('p', { className: 'msg', style: { font: '700 16px/1.3 var(--body)', textAlign: 'center', flex: 'none' }, 'aria-live': 'polite' }, msg),
     net.state !== 'online' ? h('div', { className: 'topmsg', role: 'alert', style: { borderColor: 'rgba(255,59,79,.6)' } }, h('p', { className: 'msg', style: { color: 'var(--red)', fontSize: 15 } }, 'Connection lost. ' + (net.error || ''))) : null,
     h('div', { className: 'spacer' }),
-    oppSync ? h('p', { className: 'sub', style: { textAlign: 'center', color: 'var(--mint)' } }, 'Your opponent is in SYNC TEST. Press SYNC TEST too.') : null,
-    h('div', { className: 'row' },
-      h('button', { className: 'btn sm grow', 'data-hand': '1', disabled: !syncOk, onClick: props.onSync }, 'SYNC TEST'),
-      h('button', { className: 'btn sm grow dim', disabled: true }, 'START MATCH')),
-    h('p', { className: 'sub', style: { textAlign: 'center', fontSize: 11, margin: 0, flex: 'none' } }, !net.supportsPose() ? 'The game server must be updated first (pose relay).' : both ? 'START MATCH comes with the fighting stage. SYNC TEST shows your opponent moving live.' : 'SYNC TEST shows your opponent moving live (no fighting yet).'),
     h('div', { className: 'row' },
       h('button', { className: 'btn ghost', 'data-hand': '1', onClick: props.onLeave }, 'LEAVE ROOM'),
       h('button', { className: 'btn gold grow', 'data-hand': '1', disabled: !canReady || net.state !== 'online', onClick: function () { net.setReady(!(me && me.ready)); } }, me && me.ready ? 'NOT READY' : 'READY')));
@@ -2895,15 +2992,11 @@ function SettingsScreen(props) {
     return h('label', { className: 'dsl', key: key }, h('span', null, label + ' ' + SETTINGS[key].toFixed(2) + 'x'),
       h('input', { type: 'range', min: 0.4, max: 2.5, step: 0.05, value: SETTINGS[key], onChange: function (e) { setS(key, parseFloat(e.target.value)); } }));
   };
-  var segBtn = function (k, label) { return h('button', { key: k, className: cfg.kind === k ? 'on' : '', 'data-hand': '1', onClick: function () { setC({ kind: k }); } }, label); };
   return h('div', { className: 'screen fit' },
     h('h2', { className: 'title' }, 'Settings'),
     h('div', { className: 'card slim sliders' }, slider('Dodge sensitivity', 'dodge'), slider('Punch sensitivity', 'punch'), slider('Neutral dead zone', 'dead')),
     h('div', { className: 'card slim' },
-      h('div', { className: 'fld' }, h('span', null, 'Online'), h('div', { className: 'seg' }, segBtn('none', 'OFF'), segBtn('ws', 'GAME SERVER'), segBtn('mock', 'LOCAL TEST'))),
-      cfg.kind === 'ws' ? h('label', { className: 'fld' }, h('span', null, 'Server address'), h('input', { type: 'url', value: cfg.url, placeholder: 'wss://your-server.example.com', autoCapitalize: 'none', autoCorrect: 'off', spellCheck: false, onChange: function (e) { setC({ url: e.target.value.trim() }); } })) : null,
-      cfg.kind === 'mock' ? h('p', { className: 'sub', style: { fontSize: 12 } }, 'Local test mode only connects tabs of this browser on this device. It is for testing rooms, not for playing online.') : null,
-      h('label', { className: 'fld' }, h('span', null, 'Your name'), h('input', { type: 'text', value: cfg.name, maxLength: 14, placeholder: 'Player', autoCorrect: 'off', onChange: function (e) { setC({ name: e.target.value }); } }))),
+      h('label', { className: 'fld' }, h('span', null, 'Your name (shown to your opponent)'), h('input', { type: 'text', value: cfg.name, maxLength: 14, placeholder: 'Player', autoCorrect: 'off', onChange: function (e) { setC({ name: e.target.value }); } }))),
     h('div', { className: 'spacer' }),
     h('div', { className: 'row' }, h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: props.onMovement }, 'MOVEMENT CHECK'), h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: props.onHow }, 'HOW TO PLAY')),
     h('div', { className: 'row' }, h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: props.onCamOff }, 'TURN CAMERA OFF'), h('button', { className: 'btn gold grow', 'data-hand': '1', onClick: props.onBack }, 'BACK')));
@@ -2941,6 +3034,7 @@ function Permission(props) {
     h('h1', { className: 'logo sm' }, 'Motion Boxing'),
     h('div', { className: 'topmsg', role: busy || err ? 'alert' : undefined },
       h('div', { className: 'kicker' }, 'ENABLE CAMERA'),
+      props.invite ? h('p', { className: 'msg', style: { color: 'var(--gold)' } }, 'You were invited to room ' + props.invite + '. Enable your camera to join.') : null,
       busy ? h('p', { className: 'msg' }, phase === 'camera' ? 'Waiting for camera permission… choose Allow in the browser prompt.' : 'Loading the pose model…')
       : err ? h('div', null, h('p', { className: 'msg', style: { color: 'var(--red)' } }, denied ? 'Camera permission was denied.' : err.message),
           h('p', { className: 'sub', style: { marginTop: 6 } }, denied ? 'On iPhone: tap the aA icon in the address bar, then Website Settings, then Camera, then Allow. After that press TRY AGAIN.' : (advice[err.code] || '')),
@@ -3152,6 +3246,110 @@ function Result(props) {
     h('button', { className: 'btn ghost', 'data-hand': '1', onClick: props.onHome }, 'MAIN MENU'));
 }
 
+/* ======================================================================
+   MULTIPLAYER MATCH (stage 4). The server owns the turn clock, stamina, health, damage and the end of the match.
+   This screen only (1) sends my pose and my punch events, (2) draws the server's state through the normal HUD, and (3) shows the opponent from their pose packets.
+   ====================================================================== */
+function mpHit(G, ev, me, fx, time) {
+  var pt = PUNCH[ev.k] || PUNCH.jab, mine = ev.att === me, gx = 240 + (ev.s === 'R' ? 1 : -1) * 30, px = 240 + G.p.x, dmg = Math.round(ev.dmg);
+  if (mine) {
+    if (ev.res === 'offturn') { G.offTurn++; addPopup(G, 'DEFEND!', 240 + (ev.s === 'R' ? 40 : -40), 430, '#ff6b6b', 26); return; }
+    if (ev.res === 'tired') { G.rejected++; addPopup(G, 'TIRED', 240 + (ev.s === 'R' ? 40 : -40), 430, '#ff9f43', 28); return; }
+    G.swings++; G.exec++; G.moves[ev.k] = (G.moves[ev.k] || 0) + 1;
+    if (ev.res === 'hit') {
+      G.hits++; G.combo++; G.comboT = 1.6; G.score += Math.round(pt.dmg * 10);
+      G.shake = Math.max(G.shake, 6 + pt.dmg * 0.8); G.hitstop = 0.04 + pt.dmg * 0.003; fx.punchHit(); burst(G, gx, 245, pt.col, 8 + Math.round(pt.dmg), 200 + pt.dmg * 8);
+      addPopup(G, (ev.ctr ? 'COUNTER ' : '') + pt.label + ' +' + dmg, gx, 190, ev.ctr ? '#3be8ff' : pt.col, ev.k === 'jab' ? 34 : 40);
+      if (K3.opp) K3.opp.st.hit = { t0: time, src: ev.id };
+    } else if (ev.res === 'dodge') { G.combo = 0; fx.dodge(); addPopup(G, 'MISSED!', 240 + (ev.s === 'R' ? 60 : -60), 215, '#3be8ff', 30); }
+    else { G.combo = 0; fx.block(); G.shake = Math.max(G.shake, 4); burst(G, gx, 250, '#a4acdc', 6, 160); addPopup(G, 'BLOCKED', gx, 215, '#a4acdc', 30); }
+  } else if (ev.res === 'hit') {
+    G.taken++; G.p.hurt = 0.45; if (G.mixer) G.mixer.play('hit'); G.flash = 1; G.shake = 10 + dmg; G.hitstop = 0.05 + dmg * 0.004; G.combo = 0;
+    fx.hurt(); addPopup(G, '-' + dmg, px, 410, '#ff3b4f', 52); burst(G, px, 480, '#ff3b4f', 16, 280);
+  } else if (ev.res === 'dodge') { G.dodges++; G.score += 150; addPopup(G, 'DODGED!', px, 420, '#3be8ff', 42); fx.dodge(); }
+  else { G.blocks++; addPopup(G, 'BLOCKED -' + dmg, px, 400, '#a4acdc', 32); fx.block(); G.shake = Math.max(G.shake, 7); burst(G, px, 500, '#6f8cff', 10, 200); }
+}
+function MpMatch(props) {
+  var net = props.net, cv = useRef(null), endRef = useRef(null), k3 = useK3(), cs = useState(true), conn = cs[0], setConn = cs[1];
+  useEffect(function () {
+    var canvas = cv.current, ctx = canvas.getContext('2d'), dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    canvas.width = W * dpr; canvas.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    var room = net.room, me = room ? room.you : 0, mine = room && room.players.filter(function (p) { return p.slot === me; })[0], opp = room && room.players.filter(function (p) { return p.slot !== me; })[0];
+    HUDN = { L: String(mine ? mine.name : 'YOU').toUpperCase().slice(0, 12), R: String(opp ? opp.name : 'OPPONENT').toUpperCase().slice(0, 12) };
+    var bg = makeBackground(dpr), G = createGame('game'), raf = 0, last = performance.now(), dead = false, finished = false, buf = new Pose.Buffer(), ms = net.matchState || null, msAt = performance.now(), hits = [], endT = 0;
+    G.sync = true; G.remote = { pose: null, status: 'empty' }; G.phase = 'cd'; G.turn = null;
+    var sender = new Pose.Sender({ send: function (m) { net.poseSeq = m.q; net.sendPose(m); }, hz: 20 }); sender.seq = net.poseSeq || 0;         // sequence and punch ids keep counting across rematches on the same connection
+    var off = net.on(function (e) {
+      if (e.type === 'state') { setConn(e.state === 'online'); return; }
+      var m = e.msg;
+      if (m.t === 'pose') buf.push(m, performance.now());
+      else if (m.t === 'punch') buf.pushEvent(m);
+      else if (m.t === 'match') { ms = m; msAt = performance.now(); }
+      else if (m.t === 'hit') hits.push(m);
+    });
+    props.input.drainPunches(); Sfx.init();
+    function finish() { if (finished) return; finished = true; var o = 1 - me; props.onEnd({ outcome: G.result ? G.result.outcome : 'lose', reason: ms ? ms.reason : '', stats: ms && ms.stats ? ms.stats[me] : G.exec ? { swings: G.swings, hits: G.hits, dodges: G.dodges, blocks: G.blocks, taken: G.taken } : {}, oppStats: ms && ms.stats ? ms.stats[o] : {}, el: ms ? ms.el : 0, hp: ms ? ms.hp[me] : 0, oppHp: ms ? ms.hp[o] : 0, me: HUDN.L, opp: HUDN.R }); }
+    function fromServer(now) {
+      if (!ms) return; var el = now - msAt, o = 1 - me;
+      G.pHP = ms.hp[me]; G.aHP = ms.hp[o]; G.pSt = ms.st[me]; G.aSt = ms.st[o]; G.counterT = Math.max(0, (ms.ctr[me] - el) / 1000);
+      if (ms.phase === 'countdown') { G.phase = 'cd'; G.cdLeft = Math.max(0, ms.cd - el); }
+      else if (ms.phase === 'fight') { G.phase = 'fight'; var rem = Math.max(0, ms.rem - el); G.turn = { who: ms.att === me ? 'attack' : 'defend', t: rem / 1000, age: (5000 - rem) / 1000, hold: 0, n: ms.n }; }
+      else if (ms.phase === 'ended' && G.phase !== 'ended') {
+        G.phase = 'ended'; G.endT = 0; G.turn = null; G.endLabel = ms.reason === 'ko' ? 'K.O.!' : ms.reason === 'time' ? 'TIME!' : 'OPPONENT LEFT';
+        G.result = { outcome: ms.winner === me ? 'win' : ms.winner === -1 ? 'draw' : 'lose', ko: ms.reason === 'ko' }; Sfx.bell();
+      }
+    }
+    function frame(now) {
+      if (dead) return;
+      var dt = Math.min(0.05, Math.max(0, (now - last) / 1000)); last = now;
+      var pn = performance.now(); fromServer(pn);
+      stepGame(G, dt, props.input, Sfx);
+      G.pTired += ((G.pSt < STAM.low ? 1 : 0) - G.pTired) * Math.min(1, dt * 4); G.aTired += ((G.aSt < STAM.low ? 1 : 0) - G.aTired) * Math.min(1, dt * 4);
+      var P = G.p;
+      if (G.phase !== 'ended') sender.update({ x: P.x / 170, duck: P.duck, roll: P.roll, head: P.head, block: P.block, tired: G.pTired || 0, gx: P.gx / 170, trackedR: P.tracked.R, trackedL: P.tracked.L, blocking: P.blocking, lost: G.paused,
+        R: { wx: P.arm.R.wrx, wy: P.arm.R.wry, ex: P.arm.R.erx, ey: P.arm.R.ery, w: P.armW.R }, L: { wx: P.arm.L.wrx, wy: P.arm.L.wry, ex: P.arm.L.erx, ey: P.arm.L.ery, w: P.armW.L } }, pn);
+      while (G.syncOut && G.syncOut.length) { var po = G.syncOut.shift(); net.punchSeq = (net.punchSeq || 0) + 1; net.sendPunch({ t: 'punch', id: net.punchSeq, ts: Math.round(pn), s: po.s, k: po.k }); }
+      var smp = buf.sample(pn); G.remote.pose = smp.pose; G.remote.status = smp.status;
+      var evs = buf.drainEvents(pn);
+      for (var i = 0; i < evs.length; i++) if (K3.opp) { K3.opp.st.boost[evs[i].s] = now / 1000; K3.opp.st.kind[evs[i].s] = evs[i].k; }
+      while (hits.length) mpHit(G, hits.shift(), me, Sfx, now / 1000);
+      drawScene(ctx, G, now / 1000, bg, true);
+      if (G.phase === 'cd') { var left = G.cdLeft == null ? 3500 : G.cdLeft; textOutlined(ctx, left > 3000 ? 'GET READY' : left > 0 ? String(Math.ceil(left / 1000)) : 'FIGHT!', 240, H / 2 - 40, left > 3000 ? 44 : 96, '#ffc42e', 1); }
+      if (G.phase === 'fight' && G.counterT > 0) textOutlined(ctx, 'COUNTER NOW!', 240, 300, 30 + 3 * Math.sin(now / 60), '#3be8ff', 1);
+      if (G.phase === 'ended' && G.endT > 2.6) finish();
+      if (G.phase !== 'ended') {                       // leave gesture: both hands above the head for 1.5 s (this forfeits the match)
+        var u = props.tracker.getUpper(), up = u.R && u.L && u.R.wry < -1.3 && u.L.wry < -1.3;
+        endT = up ? endT + dt : Math.max(0, endT - dt * 2);
+        if (endRef.current) { endRef.current.style.opacity = endT > 0.05 ? '1' : '0'; endRef.current.firstChild.style.width = Math.min(100, endT / 1.5 * 100) + '%'; }
+        if (endT >= 1.5) { net.leaveRoom(); props.onLeave(); return; }
+      }
+      raf = requestAnimationFrame(frame);
+    }
+    raf = requestAnimationFrame(frame);
+    return function () { dead = true; cancelAnimationFrame(raf); off(); HUDN = null; };
+  }, []);
+  return h('div', { className: 'mfs' },
+    h('div', { className: 'mwrap' },
+      h('canvas', { ref: cv, className: 'mcv', 'aria-label': 'Online boxing match' }),
+      h('div', { className: 'mpip' }, h(Preview, { tracker: props.tracker, fixed: true }), h(MStatus, { tracker: props.tracker })),
+      h('div', { className: 'mend', ref: endRef }, h('i')),
+      !conn ? h('div', { className: 'syncnote' }, 'CONNECTION LOST. The match cannot continue.', h('div', { style: { marginTop: 8 } }, h('button', { className: 'btn gold sm', 'data-hand': '1', onClick: props.onLeave }, 'LEAVE'))) : null,
+      h('div', { className: 'mhint' }, 'Leave (forfeits): raise both hands above your head for 1.5 s')));
+}
+function MpResult(props) {
+  var r = props.result, st = r.stats || {}, os = r.oppStats || {}, mm = Math.floor((r.el || 0) / 60000), ss = Math.floor((r.el || 0) / 1000) % 60;
+  var title = r.outcome === 'win' ? 'YOU WIN!' : r.outcome === 'draw' ? 'DRAW' : 'YOU LOSE';
+  var why = r.reason === 'ko' ? (r.outcome === 'win' ? 'K.O.! You knocked ' + r.opp + ' out.' : r.opp + ' knocked you out.') : r.reason === 'time' ? 'Time is up. The fighter with more health wins.' : r.reason === 'left' ? 'Your opponent left the match.' : '';
+  var stat = function (l, v) { return h('div', { className: 'stat' }, h('span', null, l), h('b', null, v)); };
+  return h('div', { className: 'screen fit' },
+    h('h2', { className: 'result-title ' + (r.outcome === 'lose' ? 'lose' : 'win') }, title),
+    why ? h('p', { className: 'sub center', style: { flex: 'none' } }, why) : null,
+    h('div', { className: 'stats' }, stat('Time', mm + ':' + (ss < 10 ? '0' : '') + ss), stat('Punches landed', (st.hits || 0) + ' / ' + (st.swings || 0)), stat('Dodges', st.dodges || 0), stat('Blocks', st.blocks || 0), stat('Hits taken', st.taken || 0), stat('Health left', Math.round(r.hp || 0) + ' vs ' + Math.round(r.oppHp || 0))),
+    h('div', { className: 'spacer' }),
+    h('button', { className: 'btn gold', 'data-hand': '1', onClick: props.onLobby }, 'BACK TO ROOM (REMATCH)'),
+    h('button', { className: 'btn ghost', 'data-hand': '1', onClick: props.onHome }, 'MAIN MENU'));
+}
+
 /* Stage 3 test screen: my fighter plus the opponent's fighter, driven only by their pose packets over the network. No damage, no AI. */
 var SYNC_TXT = { empty: 'WAITING FOR THE OPPONENT', live: 'LIVE', holding: 'SIGNAL WEAK', stale: 'OPPONENT SIGNAL LOST' };
 function SyncTest(props) {
@@ -3218,12 +3416,15 @@ function App() {
   var s7 = useState(false), howOpen = s7[0], setHowOpen = s7[1];
   var s8 = useState('training'), gmode = s8[0], setGmode = s8[1];
   var s9 = useState(loadNetCfg), cfg = s9[0], setCfg = s9[1];
+  var s10 = useState(null), mpRes = s10[0], setMpRes = s10[1];
+  var inviteRef = useRef(null); if (inviteRef.current === null) inviteRef.current = inviteCode();         // a friend's invite link: ?room=ABC234
   var netRef = useRef(null); if (!netRef.current) netRef.current = makeNet(cfg);
   var net = netRef.current;
   var k3 = useK3();
+  useEffect(function () { warmServer(cfg); }, []);
   useEffect(function () { K3.load(); return function () { tracker.destroy(); dbg.current.detach(); netRef.current.close(); }; }, []);
   var input = mode === 'debug' ? dbg.current : tracker;
-  var online = screen === 'online' || screen === 'room' || screen === 'lobby' || screen === 'sync';
+  var online = screen === 'room' || screen === 'lobby' || screen === 'mp' || screen === 'mpresult';
   // the server needs to know whether this player's camera tracking is ready (while in an online screen)
   useEffect(function () {
     if (!online) return;
@@ -3238,8 +3439,9 @@ function App() {
     if (!online) return;
     return net.on(function (e) {
       if (e.type !== 'msg') return;
-      if (e.msg.t === 'room') setScreen(function (sc) { return sc === 'room' ? 'lobby' : sc === 'sync' && e.msg.players.length < 2 ? 'lobby' : sc; });
-      else if (e.msg.t === 'left') setScreen(function (sc) { return sc === 'lobby' || sc === 'sync' ? 'room' : sc; });
+      if (e.msg.t === 'room') { inviteRef.current = ''; setScreen(function (sc) { return sc === 'room' ? 'lobby' : sc; }); }
+      else if (e.msg.t === 'left') setScreen(function (sc) { return sc === 'lobby' || sc === 'mp' || sc === 'mpresult' ? 'room' : sc; });
+      else if (e.msg.t === 'match' && e.msg.phase !== 'ended') setScreen(function (sc) { return sc === 'lobby' ? 'mp' : sc; });        // both ready: the server started a match
     });
   }, [online, net]);
   function menu() { dbg.current.detach(); setMode('camera'); setScreen(camOn && calibrated ? 'menu' : 'permission'); }
@@ -3247,19 +3449,19 @@ function App() {
   function camOff() { netRef.current.close(); tracker.releaseCamera(); setCamOn(false); setCalibrated(false); setScreen('permission'); }
   function play(m) { if (m) setGmode(m); setRound(function (r) { return r + 1; }); setScreen('match'); }
   function applyCfg(c) { saveNetCfg(c); setCfg(c); netRef.current.close(); netRef.current = makeNet(c); }
-  var cursorOn = camOn && mode === 'camera' && screen !== 'permission' && (screen !== 'match' || /[?&]dev=1/.test(location.search));
+  var cursorOn = camOn && mode === 'camera' && screen !== 'permission' && screen !== 'mp' && (screen !== 'match' || /[?&]dev=1/.test(location.search));
   var body;
   if (screen === 'permission') body = h(Permission, {
-    tracker: tracker, onBack: home,
+    tracker: tracker, onBack: home, invite: inviteRef.current,
     onReady: function () { tracker.startTracking(); setMode('camera'); setCamOn(true); setCalibrated(false); setScreen('calibration'); },
     onDebug: function () { tracker.releaseCamera(); setCamOn(false); setCalibrated(false); dbg.current.attach(); setMode('debug'); play('training'); }
   });
-  else if (screen === 'calibration') body = h(Calibration, { tracker: tracker, onDone: function () { setCalibrated(true); setScreen('menu'); }, onBack: camOff });
-  else if (screen === 'menu') body = h(MainMenu, { tracker: tracker, camOn: camOn, k3: k3, onOnline: function () { setScreen('online'); }, onTraining: function () { play('training'); }, onSettings: function () { setScreen('settings'); } });
-  else if (screen === 'online') body = h(OnlineMenu, { key: 'o' + cfg.kind + cfg.url, net: net, onPrivate: function () { setScreen('room'); }, onVsAi: function () { netRef.current.close(); play('game'); }, onBack: function () { netRef.current.close(); setScreen('menu'); } });
-  else if (screen === 'room') body = h(PrivateRoom, { net: net, onSettings: function () { netRef.current.close(); setScreen('settings'); }, onBack: function () { setScreen('online'); } });
-  else if (screen === 'lobby') body = h(Lobby, { net: net, onSync: function () { setScreen('sync'); }, onLeave: function () { netRef.current.leaveRoom(); setScreen('room'); } });
-  else if (screen === 'sync') body = h(SyncTest, { net: net, tracker: tracker, input: input, onBack: function () { setScreen('lobby'); } });
+  else if (screen === 'calibration') body = h(Calibration, { tracker: tracker, onDone: function () { setCalibrated(true); setScreen(inviteRef.current ? 'room' : 'menu'); }, onBack: camOff });
+  else if (screen === 'menu') body = h(MainMenu, { tracker: tracker, camOn: camOn, k3: k3, onOnline: function () { setScreen('room'); }, onTraining: function () { play('training'); }, onSettings: function () { setScreen('settings'); } });
+  else if (screen === 'room') body = h(PrivateRoom, { key: 'r' + cfg.url + cfg.kind, net: net, autoJoin: inviteRef.current, onVsAi: inviteRef.current ? null : function () { netRef.current.close(); play('game'); }, onBack: function () { inviteRef.current = ''; netRef.current.close(); setScreen('menu'); } });
+  else if (screen === 'lobby') body = h(Lobby, { net: net, onLeave: function () { netRef.current.leaveRoom(); setScreen('room'); } });
+  else if (screen === 'mp') body = h(MpMatch, { key: 'mp', net: net, tracker: tracker, input: input, onLeave: function () { setScreen('room'); }, onEnd: function (r) { setMpRes(r); setScreen('mpresult'); } });
+  else if (screen === 'mpresult') body = h(MpResult, { result: mpRes || {}, onLobby: function () { setScreen(netRef.current.room ? 'lobby' : 'room'); }, onHome: home });
   else if (screen === 'settings') body = h(SettingsScreen, { cfg: cfg, onCfg: applyCfg, onMovement: function () { setScreen('tutorial'); }, onHow: function () { setHowOpen(true); }, onCamOff: camOff, onBack: function () { setScreen('menu'); } });
   else if (screen === 'tutorial') body = h(Tutorial, { tracker: tracker, mode: 'settings', onDone: function () { setScreen('settings'); }, onProgress: function () { }, onBack: function () { setScreen('settings'); } });
   else if (screen === 'match') body = h(Match, { key: round, mode: gmode, tracker: tracker, input: input, debug: mode === 'debug', onQuit: home, onEnd: function (r) { setResult(r); setScreen('result'); } });
@@ -3267,7 +3469,7 @@ function App() {
   return h(React.Fragment, null, body, howOpen ? h(HowTo, { onClose: function () { setHowOpen(false); } }) : null, cursorOn ? h(HandCursor, { tracker: tracker, lowOnly: screen === 'match' }) : null);
 }
 
-window.__MB = { UI: { App: App, MainMenu: MainMenu, OnlineMenu: OnlineMenu, PrivateRoom: PrivateRoom, Lobby: Lobby, SettingsScreen: SettingsScreen, HowTo: HowTo, NetStatus: NetStatus, Permission: Permission, Calibration: Calibration, Tutorial: Tutorial, Match: Match, SyncTest: SyncTest, Result: Result, DevPanel: DevPanel, MStatus: MStatus, VisPips: VisPips, HandCursor: HandCursor, HandHint: HandHint, MirrorCanvas: MirrorCanvas, HeroCanvas: HeroCanvas }, makeBackground: makeBackground, KRig: KRig, K3: K3, drawScene: drawScene, SETTINGS: SETTINGS, AnimMixer: AnimMixer, GestureEngine: GestureEngine, Tracker: Tracker, createGame: createGame, stepGame: stepGame, k3OptsRemote: k3OptsRemote, Pose: Pose, CFG: CFG, SilentFx: SilentFx, ATK: ATK };
+window.__MB = { UI: { App: App, MainMenu: MainMenu, PrivateRoom: PrivateRoom, Lobby: Lobby, SettingsScreen: SettingsScreen, HowTo: HowTo, NetStatus: NetStatus, Permission: Permission, Calibration: Calibration, Tutorial: Tutorial, Match: Match, SyncTest: SyncTest, MpMatch: MpMatch, MpResult: MpResult, mpHit: mpHit, Result: Result, DevPanel: DevPanel, MStatus: MStatus, VisPips: VisPips, HandCursor: HandCursor, HandHint: HandHint, MirrorCanvas: MirrorCanvas, HeroCanvas: HeroCanvas }, makeBackground: makeBackground, KRig: KRig, K3: K3, drawScene: drawScene, SETTINGS: SETTINGS, AnimMixer: AnimMixer, GestureEngine: GestureEngine, Tracker: Tracker, createGame: createGame, stepGame: stepGame, k3OptsRemote: k3OptsRemote, Pose: Pose, inviteCode: inviteCode, inviteUrl: inviteUrl, CFG: CFG, SilentFx: SilentFx, ATK: ATK };
 var rootEl = document.getElementById('root');
 if (rootEl && ReactDOM.createRoot) ReactDOM.createRoot(rootEl).render(h(App));
 })();
