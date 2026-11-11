@@ -343,6 +343,19 @@ html.fgm-on body { background: #050506; }
 @media (max-height: 560px) and (max-aspect-ratio: 23/20) { .fgmenu { gap: 8px; } .fgm .btn { min-height: 46px; font-size: 17px; } .fghero { top: 18%; } }
 @media (max-height: 430px) and (min-aspect-ratio: 23/20) { .fgmenu { gap: 8px; margin-top: 1vh; } .fgm .btn { min-height: 44px; font-size: 17px; } .fgm .btn.ghost { min-height: 38px; } }
 
+/* punch test */
+.ptwrap { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 10px; flex: none; align-items: start; }
+.ptprev .preview { height: 128px; aspect-ratio: auto; }
+.ptarms { display: flex; flex-direction: column; gap: 6px; }
+.ptarm { display: grid; grid-template-columns: 52px 1fr; gap: 3px 8px; align-items: center; padding: 7px 9px; border: 1px solid var(--line); border-left: 3px solid var(--gold); background: rgba(0,0,0,0.55); font: 700 11px/1 var(--body); }
+.ptarm b { font-style: italic; font-weight: 900; color: var(--gold); letter-spacing: 0.05em; grid-row: span 2; }
+.ptarm small { grid-column: 1 / -1; color: var(--mute); font-size: 10px; letter-spacing: 0.08em; }
+.ptarm.fire { background: rgba(255,196,46,0.28); border-color: var(--gold); }
+.ptb { display: grid; grid-template-columns: 42px 1fr; gap: 6px; align-items: center; font-size: 9px; color: var(--mute); }
+.ptbar { height: 7px; background: rgba(255,255,255,0.12); } .ptbar i { display: block; height: 100%; background: #9aa0aa; } .ptbar i.hot { background: var(--gold); }
+.ptcnt { display: flex; flex-wrap: wrap; gap: 6px 10px; font: italic 900 13px/1 var(--body); color: var(--ink); flex: none; align-items: center; }
+.ptcnt em { flex-basis: 100%; font-style: normal; font-weight: 700; color: var(--gold); font-size: 14px; min-height: 18px; }
+.ptext { width: 100%; height: 84px; background: rgba(0,0,0,0.6); color: var(--ink); border: 1px solid var(--line); font: 10px/1.2 monospace; resize: none; }
 /* calibration */
 .fgm .calib .ckrow { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; flex: none; }
 .fgm .calib .ck { position: relative; overflow: hidden; padding: 9px 6px; text-align: center; font: italic 900 12px/1.1 var(--body); letter-spacing: 0.05em; color: var(--mute); background: rgba(0,0,0,0.6); border: 1px solid var(--line); border-radius: 3px; }
@@ -928,6 +941,8 @@ var CFG = {
     reachRate: 1.6,               // wrist-to-shoulder distance growth (SW/s)
     zRate: 1.3,                   // wrist toward the camera (MediaPipe z, SW/s); weak, noisy
     scaleRate: 0.9,               // hand growing in the image (wrist-to-fingers length, SW/s); the best single-camera depth cue
+    r3Rate: 3.5, fzRate: 3.0, e3Rate: 1.8, r3Disp: 0.5, fzDisp: 0.5, e3Disp: 0.35,   // each cue needs BOTH the rate and the distance travelled over the last 150-500 ms, so landmark noise cannot fake it. REAL 3D cues from MediaPipe's world landmarks (metres, hip centred): 3D wrist-to-shoulder distance growth (shoulder widths/s), wrist moving toward the camera (SW/s), arm straightening (ratio/s)
+    dOn: 0.35,                    // depth score that arms a WINDUP on its own, so a straight punch toward the lens needs no sideways speed
     fwdMin: 0.25,                 // at least one forward cue is required for a straight punch, so speed alone is not a punch
     fire: 0.5,                    // forward-punch confidence needed to register it
     vOn: 1.0, vOff: 0.55,         // hysteresis: wrist speed that arms a WINDUP and the lower speed that counts as settled again
@@ -981,6 +996,7 @@ function mkErr(code, message, cause) { var e = new Error(message); e.code = code
    so mapping by index keeps left/right anatomically correct.
    ====================================================================== */
 /* One Euro filter: heavy smoothing while a joint is nearly still (no jitter), almost none while it moves fast (no lag). */
+function d3(a, b) { var x = a.x - b.x, y = a.y - b.y, z = a.z - b.z; return Math.sqrt(x * x + y * y + z * z); }
 function OneEuro(minC, beta) { this.minC = minC; this.beta = beta; this.x = null; this.dx = 0; }
 OneEuro.prototype.f = function (v, dt) {
   if (this.x === null) { this.x = v; this.dx = 0; return v; }
@@ -994,7 +1010,7 @@ var JOINTS = [[0, 1.5, 12], [11, 1.5, 8], [12, 1.5, 8], [13, 2, 10], [14, 2, 10]
 
 function newArm() {
   return { hist: [], st: 'GUARD', conf: 0, v: 0, ang: 0, reach: 0, raised: 0, vis: false, rel: { x: 0, y: -0.5 }, erel: { x: 0.1, y: 0.55 }, ext: 0,
-           onC: 0, offC: 0, hold: 0, first: null, peakV: 0, peakReach: 0, peakDist: 0, recT: 0, tFire: 0, retr: false, dupFlag: false, type: '', lastPunch: -1e9, cues: '', score: 0 };
+           onC: 0, offC: 0, dOnC: 0, c: null, hold: 0, first: null, peakV: 0, peakReach: 0, peakDist: 0, recT: 0, tFire: 0, retr: false, dupFlag: false, type: '', lastPunch: -1e9, cues: '', score: 0 };
 }
 
 function GestureEngine() {
@@ -1038,6 +1054,22 @@ GestureEngine.prototype.captureBaseline = function () {
   this.baseHeadRel = (this.baseNoseX - this.baseMidX) / sw;
   this.feat.noise = this.leanNoise * 100;
 };
+/* Punch-test recorder: a compact CSV of the cues of both arms (values x100) so a real session can be tuned. */
+GestureEngine.prototype.startRec = function (ms) { this.rec = { t0: null, until: ms, rows: [], n: 0, done: false }; };
+GestureEngine.prototype.recCSV = function () {
+  var r = this.rec; if (!r) return '';
+  var head = 'ms,' + ['R', 'L'].map(function (s) { return ['v', 'sc', 'fz', 'e3', 'r3', 'd', 'st', 'raw_fz', 'raw_e3', 'raw_r3'].map(function (k) { return s + '_' + k; }).join(','); }).join(',') + ',punch';
+  return 'MOTION BOXING punch test v1 (values x100, st: G guard W windup S strike R recovery Y ready)\n' + head + '\n' + r.rows.join('\n');
+};
+GestureEngine.prototype._rec = function (t, pun) {
+  var r = this.rec; if (!r || r.done) return;
+  if (r.t0 == null) r.t0 = t;
+  if (t - r.t0 > r.until) { r.done = true; return; }
+  r.n++; if (r.n % 2 && !pun) return;
+  var q = function (x) { return Math.round((x || 0) * 100); }, row = [Math.round(t - r.t0)];
+  ['R', 'L'].forEach(function (sd) { var a = this.arms[sd], c = a.c || {}; row.push(q(c.v), q(c.scC), q(c.fzC), q(c.e3C), q(c.r3C), q(c.d), (a.st || 'G').charAt(0) === 'S' ? 'S' : (a.st || 'G').charAt(0) === 'G' ? 'G' : (a.st || 'G').charAt(0), q(c.fz), q(c.e3), q(c.r3)); }, this);
+  row.push(pun || ''); r.rows.push(row.join(','));
+};
 GestureEngine.prototype.drainPunches = function () { var q = this.punches; this.punches = []; return q; };
 GestureEngine.prototype._note = function (label, t, type, side, conf, ptype) {
   var f = this.feat; f.last = label; f.lastAt = t;
@@ -1052,9 +1084,11 @@ GestureEngine.prototype._arm = function (s, L, sw, t) {
   var idx = s === 'R' ? [12, 14, 16, 20, 18] : [11, 13, 15, 19, 17];
   var S = L[idx[0]], E = L[idx[1]], Wr = L[idx[2]], Fi = L[idx[3]], Pk = L[idx[4]];
   a.vis = E.v > CFG.visMin && (s === 'R' ? f.visRW : f.visLW);
-  if (!a.vis) { a.hist.length = 0; a.st = 'GUARD'; a.conf = 0; a.v = 0; a.onC = 0; a.offC = 0; a.hold = t + P.lossMs; return null; }     // tracking loss: reset and ignore the first frames after it returns
+  if (!a.vis) { a.hist.length = 0; a.st = 'GUARD'; a.conf = 0; a.v = 0; a.onC = 0; a.offC = 0; a.dOnC = 0; a.hold = t + P.lossMs; return null; }     // tracking loss: reset and ignore the first frames after it returns
   if (a.first == null) { a.first = t; a.hold = Math.max(a.hold, t + P.warmMs); }                // the filters need a moment to settle after the tracker starts
   var ang = angleAt(E, S, Wr), reach = dist(Wr, S) / sw, zr = (S.Z - Wr.Z) / sw;
+  var w3 = this.hasW ? this.wl : null, r3 = -1, e3 = -1, fz = 0;
+  if (w3) { var sS = w3[idx[0]], eE = w3[idx[1]], wW = w3[idx[2]], swW = Math.max(0.05, d3(w3[11], w3[12])), uA = d3(sS, eE), fA = d3(eE, wW), sW = d3(sS, wW); r3 = sW / swW; e3 = sW / Math.max(0.05, uA + fA); fz = (sS.z - wW.z) / swW; }
   var hs = -1;
   if (Fi && Pk && Fi.v > CFG.visMin && Pk.v > CFG.visMin) hs = (dist(Wr, Fi) + dist(Wr, Pk)) / 2 / sw;     // hand size in the image: grows as the fist nears the lens
   var rx = (Wr.X - S.X) / sw, ry = (Wr.Y - S.Y) / sw;
@@ -1066,14 +1100,15 @@ GestureEngine.prototype._arm = function (s, L, sw, t) {
   if (last && t - last.t < 90 && Math.hypot(rx - last.rx, ry - last.ry) > P.jumpSW) { hist.length = 0; last = null; a.hold = t + P.lossMs; a.st = 'GUARD'; a.onC = 0; a.offC = 0; }      // a one-frame jump is a landmark glitch, not a punch
   for (j = hist.length - 1; j >= 0; j--) if (t - hist[j].t >= 70) { b = hist[j]; break; }
   if (!b && hist.length > 1 && t - hist[0].t >= 40) b = hist[0];
-  var v = 0, er = 0, rr = 0, zrate = 0, sr = 0, dv = 0, vUp = 0;
+  var v = 0, er = 0, rr = 0, zrate = 0, sr = 0, dv = 0, vUp = 0, r3r = 0, e3r = 0, fzr = 0;
   if (b) {
     var d = Math.max(0.03, (t - b.t) / 1000), dx = rx - b.rx, dy = ry - b.ry, dl = Math.hypot(dx, dy);
     v = dl / d; er = (ang - b.ang) / d; rr = (reach - b.reach) / d; zrate = (zr - b.zr) / d;
     sr = hs >= 0 && b.hs >= 0 ? (hs - b.hs) / d : 0;
     vUp = -dy / d; dv = v - b.v;
+    if (r3 >= 0 && b.r3 >= 0) { r3r = (r3 - b.r3) / d; e3r = (e3 - b.e3) / d; fzr = (fz - b.fz) / d; }
   }
-  hist.push({ t: t, rx: rx, ry: ry, ang: ang, reach: reach, zr: zr, hs: hs, v: v });
+  hist.push({ t: t, rx: rx, ry: ry, ang: ang, reach: reach, zr: zr, hs: hs, v: v, r3: r3, e3: e3, fz: fz });
   while (hist.length && t - hist[0].t > 500) hist.shift();
   a.v = v;
   if (v > 0.8 && Math.abs(vUp) > 0.75 * v) a.vertT = t;           // mostly vertical motion (raising or lowering the guard)
@@ -1084,23 +1119,32 @@ GestureEngine.prototype._arm = function (s, L, sw, t) {
   var reachC = clamp(rr / (P.reachRate / sens), 0, 1);
   var zC = clamp(zrate / (P.zRate / sens), 0, 1);
   var scC = clamp(sr / (P.scaleRate / sens), 0, 1);
-  var fwd = Math.max(extC, reachC * 0.85, zC, scC);
+  var fwdOld = Math.max(extC, reachC * 0.85, zC, scC);              // the cues the hook and uppercut rules were tuned with (unchanged)
   var score = 0.34 * velC + 0.22 * extC + 0.16 * accC + 0.14 * Math.max(zC, reachC * 0.85) + 0.14 * scC;
+  // real depth: the 3D wrist moves toward the lens, the 3D arm straightens, the fist grows. Needs forward evidence (wrist z or hand size), so raising or swinging an arm is not enough.
+  var b2 = null; for (j = hist.length - 1; j >= 0; j--) if (t - hist[j].t >= 150) { b2 = hist[j]; break; }                  // the sample 150+ ms back: how far the limb has really travelled
+  var r3D = b2 && r3 >= 0 && b2.r3 >= 0 ? (r3 - b2.r3) / (P.r3Disp / sens) : 0, e3D = b2 && r3 >= 0 && b2.e3 >= 0 ? (e3 - b2.e3) / (P.e3Disp / sens) : 0, fzD = b2 && r3 >= 0 && b2.r3 >= 0 ? (fz - b2.fz) / (P.fzDisp / sens) : 0;
+  var r3C = Math.min(clamp(r3r / (P.r3Rate / sens), 0, 1), clamp(r3D, 0, 1)), e3C = Math.min(clamp(e3r / (P.e3Rate / sens), 0, 1), clamp(e3D, 0, 1)), fzC = Math.min(clamp(fzr / (P.fzRate / sens), 0, 1), clamp(fzD, 0, 1));
+  var fwd3 = Math.max(fzC, r3C * 0.9, e3C * 0.9), dScore = 0;
+  if (r3 >= 0) { dScore = clamp(0.45 * Math.max(fzC, scC) + 0.3 * e3C + 0.25 * r3C, 0, 1); if (Math.max(fzC, scC) < 0.25) dScore = Math.min(dScore, 0.3); }
+  score = Math.max(score, dScore);
+  var fwd = Math.max(fwdOld, fwd3);
   if (fwd < P.fwdMin) score = Math.min(score, 0.3);                // speed without any forward evidence is not a straight punch
+  a.c = { v: v, velC: velC, extC: extC, accC: accC, reachC: reachC, zC: zC, scC: scC, fzC: fzC, e3C: e3C, r3C: r3C, d: dScore, r3: r3, e3: e3, fz: fz };
   a.score = score; a.conf = Math.max(score, a.conf * 0.88);
-  a.cues = 'v' + velC.toFixed(1) + ' e' + extC.toFixed(1) + ' a' + accC.toFixed(1) + ' r' + reachC.toFixed(1) + ' z' + zC.toFixed(1) + ' h' + scC.toFixed(1);
+  a.cues = 'v' + velC.toFixed(1) + ' e' + extC.toFixed(1) + ' a' + accC.toFixed(1) + ' r' + reachC.toFixed(1) + ' z' + zC.toFixed(1) + ' h' + scC.toFixed(1) + ' f' + fzC.toFixed(1) + ' x' + e3C.toFixed(1) + ' d' + dScore.toFixed(1);
 
   var onV = P.vOn / sens, offV = P.vOff / sens;                    // hysteresis: separate activation and reset speeds
-  a.onC = v >= onV ? a.onC + 1 : 0; a.offC = v < offV ? a.offC + 1 : 0;
+  a.onC = v >= onV ? a.onC + 1 : 0; a.offC = (v < offV && dScore < 0.2) ? a.offC + 1 : 0; a.dOnC = dScore >= P.dOn ? a.dOnC + 1 : 0;
   var typ = null, W = a.win;
-  if ((a.st === 'GUARD' || a.st === 'READY') && a.onC >= P.onFrames && !this.block && t >= a.hold && hist.length >= 3) {
+  if ((a.st === 'GUARD' || a.st === 'READY') && (a.onC >= P.onFrames || a.dOnC >= 2) && !this.block && t >= a.hold && hist.length >= 3) {
     a.st = 'WINDUP';
     var s0 = b || hist[0];
-    W = a.win = { t0: s0.t, rx0: s0.rx, ry0: s0.ry, reach0: s0.reach, minRx: Math.min(s0.rx, rx), maxRx: Math.max(s0.rx, rx), highRy: Math.min(s0.ry, ry), lowRy: Math.max(s0.ry, ry), peakV: v, peakVUp: vUp, maxFwd: fwd, peakScore: score, maxZS: Math.max(zC, scC), maxEZ: Math.max(extC, zC), seen: 0 };
+    W = a.win = { t0: s0.t, rx0: s0.rx, ry0: s0.ry, reach0: s0.reach, minRx: Math.min(s0.rx, rx), maxRx: Math.max(s0.rx, rx), highRy: Math.min(s0.ry, ry), lowRy: Math.max(s0.ry, ry), peakV: v, peakVUp: vUp, maxFwd: fwdOld, peakScore: score, maxZS: Math.max(zC, scC), maxEZ: Math.max(extC, zC, fzC, e3C), seen: 0, r30: s0.r3 == null ? -1 : s0.r3, peakD: dScore };
   }
   if (a.st === 'WINDUP') {
-    if (v > W.peakV) W.peakV = v; if (vUp > W.peakVUp) W.peakVUp = vUp; if (fwd > W.maxFwd) W.maxFwd = fwd; if (score > W.peakScore) W.peakScore = score;
-    if (Math.max(extC, zC) > W.maxEZ) W.maxEZ = Math.max(extC, zC);
+    if (v > W.peakV) W.peakV = v; if (vUp > W.peakVUp) W.peakVUp = vUp; if (fwdOld > W.maxFwd) W.maxFwd = fwdOld; if (score > W.peakScore) W.peakScore = score; if (dScore > W.peakD) W.peakD = dScore;
+    if (Math.max(extC, zC, fzC, e3C) > W.maxEZ) W.maxEZ = Math.max(extC, zC, fzC, e3C);
     if (zC > W.maxZS) W.maxZS = zC; if (scC > W.maxZS) W.maxZS = scC;
     if (rx < W.minRx) W.minRx = rx; if (rx > W.maxRx) W.maxRx = rx; if (ry < W.highRy) W.highRy = ry; if (ry > W.lowRy) W.lowRy = ry;
     if (!W.seen && score >= P.fire && fwd >= P.fwdMin) W.seen = t;
@@ -1109,18 +1153,18 @@ GestureEngine.prototype._arm = function (s, L, sw, t) {
     var oth = this.arms[s === 'R' ? 'L' : 'R'], bothRise = oth.st === 'WINDUP' && oth.win && (oth.win.lowRy - oth.rel.y) > 0.4;      // both hands rising together is a block or a raise, not an uppercut
     if (rise >= Up.rise && rise >= Up.ratio * dxR && W.lowRy >= Up.fromY && ry >= Up.toY && !bothRise && W.peakVUp >= Up.vUp / sens && W.maxFwd < Up.fwdMax && rg > -0.3) decided = 'upper';
     else if (dxR >= Hk.dx && dxR >= Hk.ratio * dyR && W.maxFwd < Hk.fwdMax && W.peakV >= Hk.v / sens && rg > -0.3) decided = 'hook';
-    else if (W.seen && rg > -0.12 && !((a.vertT != null && t - a.vertT < 300 || dyR > 0.45 && dyR > 1.5 * dxR) && W.maxEZ < 0.3) && (t - W.seen >= P.fwdSettleMs || v < 0.8 * W.peakV)) decided = (W.peakV >= P.cross.v / sens && (reach >= P.cross.reach || ang >= P.cross.ang)) ? 'cross' : 'jab';
+    else if (W.seen && rg > -0.12 && !((a.vertT != null && t - a.vertT < 300 || dyR > 0.45 && dyR > 1.5 * dxR) && W.maxEZ < 0.3) && (t - W.seen >= P.fwdSettleMs || v < 0.8 * W.peakV)) decided = ((W.peakV >= P.cross.v / sens && (reach >= P.cross.reach || ang >= P.cross.ang)) || (W.peakD >= 0.85 && e3 >= 0.93)) ? 'cross' : 'jab';
     if (decided) {
-      a.st = 'STRIKE'; a.type = decided; a.tFire = t; a.lastPunch = t; a.peakV = W.peakV; a.peakReach = reach; a.peakDist = Math.hypot(rx - W.rx0, ry - W.ry0); a.dupFlag = false;
+      a.st = 'STRIKE'; a.type = decided; a.tFire = t; a.lastPunch = t; a.peakV = W.peakV; a.peakReach = reach; a.peakDist = Math.hypot(rx - W.rx0, ry - W.ry0); a.peakR3 = r3; a.dupFlag = false;
       typ = decided;
     } else if (el > P.windMs || (a.offC >= 3 && el >= 120)) a.st = 'GUARD';        // not a punch (or ambiguous): never guess
   } else if (a.st === 'STRIKE') {
-    W = a.win; if (v > a.peakV) a.peakV = v; if (reach > a.peakReach) a.peakReach = reach;
+    W = a.win; if (v > a.peakV) a.peakV = v; if (reach > a.peakReach) a.peakReach = reach; if (r3 > a.peakR3) a.peakR3 = r3;
     var dd = Math.hypot(rx - W.rx0, ry - W.ry0); if (dd > a.peakDist) a.peakDist = dd;
     if ((t - a.tFire >= 60 && v < 0.4 * a.peakV) || t - a.tFire > P.extMs) { a.st = 'RECOVERY'; a.recT = t; a.retr = false; }
   } else if (a.st === 'RECOVERY') {
     W = a.win; var dS = Math.hypot(rx - W.rx0, ry - W.ry0);
-    if (dS <= 0.45 * a.peakDist || reach <= W.reach0 + 0.4 * (a.peakReach - W.reach0)) a.retr = true;      // the hand has come back toward where it started
+    if (dS <= 0.45 * a.peakDist || reach <= W.reach0 + 0.4 * (a.peakReach - W.reach0) || (r3 >= 0 && W.r30 >= 0 && r3 <= W.r30 + 0.4 * (a.peakR3 - W.r30))) a.retr = true;      // the hand has come back toward where it started
     if (score >= P.fire && v >= onV && !a.dupFlag) { a.dupFlag = true; this.dupPrev++; f.dupPrev = this.dupPrev; }     // a second burst during recovery: counted, not fired
     if (v < offV) a.dupFlag = false;
     var rel = t - a.recT;
@@ -1129,7 +1173,7 @@ GestureEngine.prototype._arm = function (s, L, sw, t) {
   return typ;
 };
 
-GestureEngine.prototype.update = function (raw, vw, vh, t) {
+GestureEngine.prototype.update = function (raw, vw, vh, t, world) {
   var i, f = this.feat, L = this.lm, ar = vh / vw;
   var dt = this.lastT == null ? 0.033 : clamp((t - this.lastT) / 1000, 0.008, 0.1); this.lastT = t;
   for (i = 0; i < JOINTS.length; i++) {
@@ -1140,6 +1184,15 @@ GestureEngine.prototype.update = function (raw, vw, vh, t) {
     o.Y = F[1].f(q.y * ar, dt) * vw;
     o.Z = F[2].f(q.z, dt) * vw;
     o.v = q.visibility == null ? 1 : q.visibility;
+  }
+  var WJ = [11, 12, 13, 14, 15, 16], wi, wq, wo, WF;                  // metric 3D landmarks (world space): real depth for straight punches
+  this.hasW = !!(world && world.length >= 17);
+  if (this.hasW) {
+    var wl = this.wl || (this.wl = []), wfl = this.wflt || (this.wflt = {});
+    for (wi = 0; wi < WJ.length; wi++) {
+      var wj = WJ[wi]; wq = world[wj]; WF = wfl[wj] || (wfl[wj] = [new OneEuro(3, 12), new OneEuro(3, 12), new OneEuro(2, 8)]); wo = wl[wj] || (wl[wj] = {});
+      wo.x = WF[0].f(wq.x, dt); wo.y = WF[1].f(wq.y, dt); wo.z = WF[2].f(wq.z, dt);
+    }
   }
   // Upper body only: nose (0), shoulders (11/12), elbows (13/14), wrists (15/16) and the hand points (17-20). Hips and legs are never read.
   var RS = L[12], LS = L[11], nose = L[0];
@@ -1169,8 +1222,9 @@ GestureEngine.prototype.update = function (raw, vw, vh, t) {
 
   // ---- arms ----
   var sides = ['R', 'L'], si;
-  for (si = 0; si < 2; si++) { var pt = this._arm(sides[si], L, sw, t); if (pt) this._note((sides[si] === 'R' ? 'RIGHT ' : 'LEFT ') + (pt === 'upper' ? 'UPPERCUT' : pt.toUpperCase()), t, 'punch', sides[si], clamp(Math.max(this.arms[sides[si]].win.peakScore, 0.6), 0, 1), pt); }
+  for (si = 0; si < 2; si++) { var pt = this._arm(sides[si], L, sw, t); if (pt) { if (this.rec) this._rec(t, sides[si] + pt.charAt(0).toUpperCase()); this._note((sides[si] === 'R' ? 'RIGHT ' : 'LEFT ') + (pt === 'upper' ? 'UPPERCUT' : pt.toUpperCase()), t, 'punch', sides[si], clamp(Math.max(this.arms[sides[si]].win.peakScore, 0.6), 0, 1), pt); } }
   var aR = this.arms.R, aL = this.arms.L;
+  if (this.rec) this._rec(t, null);
   f.angR = aR.ang; f.angL = aL.ang; f.pcR = aR.conf; f.pcL = aL.conf; f.vR = aR.v; f.vL = aL.v; f.stR = aR.st; f.stL = aL.st;
   f.rRaised = aR.vis && aR.raised > CFG.raiseAbove;
   f.lRaised = aL.vis && aL.raised > CFG.raiseAbove;
@@ -1408,7 +1462,7 @@ Tracker.prototype._process = function () {
   var raw = res && res.landmarks && res.landmarks[0];
   if (raw && raw.length >= 25) {
     this.lostN = 0;
-    this.engine.update(raw, s.vw, s.vh, t);
+    this.engine.update(raw, s.vw, s.vh, t, res.worldLandmarks && res.worldLandmarks[0]);
   } else if (++this.lostN > 8 && s.status !== 'camera-ready') {
     this.engine.reset();
   }
@@ -3217,8 +3271,53 @@ function SettingsScreen(props) {
     h('div', { className: 'card slim' },
       h('label', { className: 'fld' }, h('span', null, 'Your name (shown to your opponent)'), h('input', { type: 'text', value: cfg.name, maxLength: 14, placeholder: 'Player', autoCorrect: 'off', onChange: function (e) { setC({ name: e.target.value }); } }))),
     h('div', { className: 'spacer' }),
-    h('div', { className: 'row' }, h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: props.onMovement }, 'MOVEMENT CHECK'), h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: props.onHow }, 'HOW TO PLAY')),
-    h('div', { className: 'row' }, h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: props.onCamOff }, 'TURN CAMERA OFF'), h('button', { className: 'btn gold grow', 'data-hand': '1', onClick: props.onBack }, 'BACK')));
+    h('div', { className: 'row' }, h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: props.onMovement }, 'MOVEMENT CHECK'), h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: props.onPunchTest }, 'PUNCH TEST')),
+    h('div', { className: 'row' }, h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: props.onHow }, 'HOW TO PLAY'), h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: props.onCamOff }, 'CAMERA OFF')),
+    h('div', { className: 'row' }, h('span', { style: { display: 'none' } }), h('button', { className: 'btn gold grow', 'data-hand': '1', onClick: props.onBack }, 'BACK')));
+}
+
+/* PUNCH TEST: throw punches at the camera and see what the game sees. Can record 8 seconds of the cues as text to send for tuning. */
+function PunchTest(props) {
+  var tracker = props.tracker, eng = tracker.engine, st = useState(0), bump = st[1];
+  var cs = useState({ jab: 0, cross: 0, hook: 0, upper: 0, last: '' }), cnt = cs[0], setCnt = cs[1];
+  var rs = useState({ on: false, text: '', left: 0 }), rec = rs[0], setRec = rs[1];
+  var ta = useRef(null), msg = useState(''), note = msg[0], setNote = msg[1];
+  useEffect(function () {
+    var id = setInterval(function () {
+      var q = tracker.drainPunches();
+      if (q.length) setCnt(function (c) { var n = Object.assign({}, c); q.forEach(function (p) { n[p.type] = (n[p.type] || 0) + 1; n.last = (p.side === 'R' ? 'RIGHT ' : 'LEFT ') + (p.type === 'upper' ? 'UPPERCUT' : p.type.toUpperCase()); }); return n; });
+      var r = eng.rec;
+      if (r && !r.done) setRec({ on: true, text: '', left: Math.max(0, Math.ceil((r.until - (r.t0 == null ? 0 : performance.now() - r.t0)) / 1000)) });
+      else if (r && r.done) { setRec({ on: false, text: eng.recCSV(), left: 0 }); eng.rec = null; }
+      bump(function (n) { return n + 1; });
+    }, 100);
+    return function () { clearInterval(id); eng.rec = null; };
+  }, [tracker]);
+  function record() { eng.startRec(8000); setRec({ on: true, text: '', left: 8 }); setNote(''); }
+  function copy() {
+    var el = ta.current; if (!el) return;
+    try { el.focus(); el.select(); } catch (e) { }
+    var ok = false; try { ok = document.execCommand('copy'); } catch (e) { }
+    if (!ok && navigator.clipboard) { navigator.clipboard.writeText(rec.text).then(function () { setNote('Copied. Paste it in the chat.'); }, function () { setNote('Press and hold the text, choose Copy.'); }); return; }
+    setNote(ok ? 'Copied. Paste it in the chat.' : 'Press and hold the text, choose Copy.');
+  }
+  var bar = function (label, v, hot) { return h('div', { className: 'ptb' }, h('span', null, label), h('div', { className: 'ptbar' }, h('i', { className: hot ? 'hot' : '', style: { width: clamp(v, 0, 1) * 100 + '%' } }))); };
+  var arm = function (sd, name) {
+    var a = eng.arms[sd], c = a.c || {}, fire = a.st === 'STRIKE' || (eng.feat.lastPunchSide === sd && performance.now() - eng.feat.lastPunchAt < 400);
+    return h('div', { className: 'ptarm' + (fire ? ' fire' : ''), key: sd },
+      h('b', null, name), bar('SPEED', c.velC || 0), bar('DEPTH', c.d || 0, true), h('small', null, a.vis ? a.st : 'not visible'));
+  };
+  var tot = cnt.jab + cnt.cross + cnt.hook + cnt.upper;
+  return h('div', { className: 'screen fit' },
+    h('h2', { className: 'title' }, 'PUNCH TEST'),
+    h('div', { className: 'ptwrap' }, h('div', { className: 'ptprev' }, h(Preview, { tracker: tracker, fixed: true })), h('div', { className: 'ptarms' }, arm('R', 'RIGHT'), arm('L', 'LEFT'))),
+    h('div', { className: 'ptcnt' }, h('span', null, 'JAB ' + cnt.jab), h('span', null, 'CROSS ' + cnt.cross), h('span', null, 'HOOK ' + cnt.hook), h('span', null, 'UPPER ' + cnt.upper), h('em', null, cnt.last || 'throw a punch at the camera')),
+    !eng.hasW ? h('p', { className: 'sub', style: { fontSize: 12 } }, '3D depth data is not available from the camera model on this device. Depth punches use the hand size only.') : null,
+    rec.text ? h('div', { className: 'card slim' }, h('textarea', { ref: ta, className: 'ptext', readOnly: true, value: rec.text, onClick: function () { try { ta.current.select(); } catch (e) { } } }), h('p', { className: 'sub', style: { fontSize: 12 } }, note || 'Copy this text and paste it in the chat.')) : null,
+    h('div', { className: 'spacer' }),
+    h('div', { className: 'row' }, h('button', { className: 'btn gold grow', 'data-hand': '1', disabled: rec.on, onClick: record }, rec.on ? 'RECORDING ' + rec.left + 's' : 'RECORD 8 SEC'), h('button', { className: 'btn ghost', 'data-hand': '1', onClick: function () { setCnt({ jab: 0, cross: 0, hook: 0, upper: 0, last: '' }); } }, 'RESET')),
+    rec.text ? h('div', { className: 'row' }, h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: copy }, 'COPY DATA')) : null,
+    h('div', { className: 'row' }, h('button', { className: 'btn ghost grow', 'data-hand': '1', onClick: props.onBack }, 'BACK')));
 }
 
 function Permission(props) {
@@ -3674,7 +3773,8 @@ function App() {
   else if (screen === 'lobby') body = h(Lobby, { net: net, onLeave: function () { netRef.current.leaveRoom(); setScreen('room'); } });
   else if (screen === 'mp') body = h(MpMatch, { key: 'mp', net: net, tracker: tracker, input: input, onLeave: function () { setScreen('room'); }, onEnd: function (r) { setMpRes(r); setScreen('mpresult'); } });
   else if (screen === 'mpresult') body = h(MpResult, { result: mpRes || {}, onLobby: function () { setScreen(netRef.current.room ? 'lobby' : 'room'); }, onHome: home });
-  else if (screen === 'settings') body = h(SettingsScreen, { cfg: cfg, onCfg: applyCfg, onMovement: function () { setScreen('tutorial'); }, onHow: function () { setHowOpen(true); }, onCamOff: camOff, onBack: function () { setScreen('menu'); } });
+  else if (screen === 'settings') body = h(SettingsScreen, { cfg: cfg, onCfg: applyCfg, onMovement: function () { setScreen('tutorial'); }, onPunchTest: function () { setScreen('punchtest'); }, onHow: function () { setHowOpen(true); }, onCamOff: camOff, onBack: function () { setScreen('menu'); } });
+  else if (screen === 'punchtest') body = h(PunchTest, { tracker: tracker, onBack: function () { setScreen('settings'); } });
   else if (screen === 'tutorial') body = h(Tutorial, { tracker: tracker, mode: 'settings', onDone: function () { setScreen('settings'); }, onProgress: function () { }, onBack: function () { setScreen('settings'); } });
   else if (screen === 'match') body = h(Match, { key: round, mode: gmode, tracker: tracker, input: input, debug: mode === 'debug', onQuit: home, onEnd: function (r) { setResult(r); setScreen('result'); } });
   else body = h(Result, { result: result, tracker: tracker, camOn: camOn && mode === 'camera', debug: mode === 'debug', onAgain: function () { play(); }, onHome: home });
@@ -3689,7 +3789,7 @@ function App() {
   return h(React.Fragment, null, !full ? h('div', { className: 'fgbg', style: { backgroundImage: bgUrl } }) : null, !full ? h('div', { className: 'fgvig' }) : null, full && stage && typeof ARENA_BG_B64 !== 'undefined' ? h('div', { className: 'stagebg', style: { backgroundImage: bgUrl } }) : null, stage && !landscape ? h('div', { className: 'tvhint' }, 'TV MODE: turn your phone sideways (switch off Portrait Lock) so it fills the TV') : null, content, howOpen ? h(HowTo, { onClose: function () { setHowOpen(false); } }) : null, cursorOn ? h(HandCursor, { tracker: tracker, lowOnly: screen === 'match' }) : null);
 }
 
-window.__MB = { UI: { App: App, MainMenu: MainMenu, PrivateRoom: PrivateRoom, Lobby: Lobby, SettingsScreen: SettingsScreen, HowTo: HowTo, NetStatus: NetStatus, Permission: Permission, Calibration: Calibration, Tutorial: Tutorial, Match: Match, SyncTest: SyncTest, MpMatch: MpMatch, MpResult: MpResult, mpHit: mpHit, Result: Result, DevPanel: DevPanel, MStatus: MStatus, VisPips: VisPips, HandCursor: HandCursor, HandHint: HandHint, MirrorCanvas: MirrorCanvas, HeroCanvas: HeroCanvas, OnlineMenu: OnlineMenu, FgHero: FgHero, FgFrame: FgFrame, SrvPill: SrvPill }, makeBackground: makeBackground, KRig: KRig, K3: K3, drawScene: drawScene, SETTINGS: SETTINGS, AnimMixer: AnimMixer, GestureEngine: GestureEngine, Tracker: Tracker, createGame: createGame, stepGame: stepGame, k3OptsRemote: k3OptsRemote, Pose: Pose, inviteCode: inviteCode, inviteUrl: inviteUrl, CFG: CFG, SilentFx: SilentFx, ATK: ATK };
+window.__MB = { UI: { App: App, MainMenu: MainMenu, PrivateRoom: PrivateRoom, Lobby: Lobby, SettingsScreen: SettingsScreen, HowTo: HowTo, NetStatus: NetStatus, Permission: Permission, Calibration: Calibration, Tutorial: Tutorial, Match: Match, SyncTest: SyncTest, MpMatch: MpMatch, MpResult: MpResult, mpHit: mpHit, Result: Result, DevPanel: DevPanel, MStatus: MStatus, VisPips: VisPips, HandCursor: HandCursor, HandHint: HandHint, MirrorCanvas: MirrorCanvas, HeroCanvas: HeroCanvas, PunchTest: PunchTest, OnlineMenu: OnlineMenu, FgHero: FgHero, FgFrame: FgFrame, SrvPill: SrvPill }, makeBackground: makeBackground, KRig: KRig, K3: K3, drawScene: drawScene, SETTINGS: SETTINGS, AnimMixer: AnimMixer, GestureEngine: GestureEngine, Tracker: Tracker, createGame: createGame, stepGame: stepGame, k3OptsRemote: k3OptsRemote, Pose: Pose, inviteCode: inviteCode, inviteUrl: inviteUrl, CFG: CFG, SilentFx: SilentFx, ATK: ATK };
 var rootEl = document.getElementById('root');
 if (rootEl && ReactDOM.createRoot) ReactDOM.createRoot(rootEl).render(h(App));
 })();
